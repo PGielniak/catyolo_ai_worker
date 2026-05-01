@@ -1,0 +1,23 @@
+[project]
+name = "catyolo-worker"
+version = "0.1.0"
+description = "Cat detection worker — RTSP capture, detection pipeline, optional debug stream"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.136.1",
+    "numpy>=2.2.6",
+    "opencv-python-headless>=4.13.0.92",
+    "python-dotenv>=1.2.2",
+    "requests>=2.33.1",
+    "uvicorn>=0.46.0",
+]
+
+[project.scripts]
+worker = "detector.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["detector"]
