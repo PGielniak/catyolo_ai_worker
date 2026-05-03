@@ -1,7 +1,15 @@
 import threading
 import time
 import cv2
+import ctypes
 
+def set_thread_name(name: str):
+    """Set the OS-visible thread name. Linux only, max 15 chars."""
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.prctl(15, name.encode()[:15], 0, 0, 0)  # 15 = PR_SET_NAME
+    except Exception:
+        pass
 
 class FrameCapture:
     def __init__(self, rtsp_url):
@@ -19,6 +27,7 @@ class FrameCapture:
         self._thread.start()
     
     def _run(self):
+        set_thread_name("capture")
         while not self._stop.is_set():
             ret, frame = self._cap.read()
             if not ret:

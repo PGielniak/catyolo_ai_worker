@@ -9,9 +9,18 @@ import numpy as np
 from scripts.occlusion import check_occlusion
 from datetime import datetime
 from pathlib import Path
-from detector.detectors.occlusion_detection import OcclusionDetector
+from detector.detectors.occlusion_detectionV2 import OcclusionDetector
 from detector.detectors.hailo_runner import HailoRunner
 
+import ctypes
+
+def set_thread_name(name: str):
+    """Set the OS-visible thread name. Linux only, max 15 chars."""
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.prctl(15, name.encode()[:15], 0, 0, 0)  # 15 = PR_SET_NAME
+    except Exception:
+        pass
 class DetectionPipeline:
     def __init__(self, capture, api_base: str):
         self._capture = capture
@@ -79,7 +88,7 @@ class DetectionPipeline:
             logger.error("img_annotated is None")
             return
         
-        output_path = Path("/mnt/ssd/home/patryk/pycharm/catyolo_ai_worker/samples")
+        output_path = Path("/mnt/ssd/home/patryk/pycharm/catyolo_ai_worker/occl_yolo_samples")
         output_path.mkdir(parents=True, exist_ok=True)
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         target = output_path / f"{timestamp_str}_annotated.jpg"
@@ -106,6 +115,7 @@ class DetectionPipeline:
             logger.error(f"imwrite raised error: {e}")
 
     def _run(self):
+        set_thread_name("pipeline")
         logger.debug(f"Entered _run method in DetectionPipeline")
         logger.debug(f"{self._scene['scene_id']}")
         logger.debug(f"{self._scene['scene_name']}")
@@ -113,6 +123,9 @@ class DetectionPipeline:
         logger.debug(f"{self._scene['camera_port']}")
         logger.debug(f"{self._scene['action_ids']}")
         logger.debug(f"{self._scene['red_zones']}")
+        TARGET_FPS = 10  # 10 FPS is plenty for monitoring stream
+        target_dt = 1.0 / TARGET_FPS
+        next_tick = time.monotonic()
 
         last_save_minute = None
 
@@ -124,8 +137,9 @@ class DetectionPipeline:
 
             annotated = frame.copy()
 
-            # Pull the latest occlusion result and draw it
+            
             result = self._occlusion_detector.process(frame)
+
             if result is not None:
                 self._draw_occlusion(annotated, result)
 
@@ -151,17 +165,24 @@ class DetectionPipeline:
             with self._annotated_lock:
                 self._annotated = annotated
 
+            next_tick += target_dt
+            sleep_for = next_tick - time.monotonic()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            else:
+                next_tick = time.monotonic()
+
             # time.sleep(0.033)  # ~30 fps cap on the annotator loop
         
     def _draw_occlusion(self, annotated, result):
         # Global alignment info, top-left
-        shift = result.shift
-        cv2.putText(
-            annotated,
-            f"shift: ({shift[0]:.1f}, {shift[1]:.1f}) conf: {result.alignment_confidence:.2f}",
-            (10, 60),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2,
-        )
+        # shift = result.shift
+        # cv2.putText(
+        #     annotated,
+        #     f"shift: ({shift[0]:.1f}, {shift[1]:.1f}) conf: {result.alignment_confidence:.2f}",
+        #     (10, 60),
+        #     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2,
+        # )
 
         for rz in result.zones:
             x_start = rz['x']
@@ -176,10 +197,6 @@ class DetectionPipeline:
                 colour = (0, 165, 255)  # orange
                 status = 'free'
 
-            cv2.putText(annotated, f"og_brightness {rz['original_mean_brightness']:.2f}",
-                        (x_start, y_start - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 2)
-            cv2.putText(annotated, f"brightness {rz['mean_brightness']:.2f}",
-                        (x_start, y_start - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 2)
             cv2.putText(annotated, f"{status} - {rz['occlusion_score']:.2f}",
                         (x_start, y_start - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 2)
             cv2.rectangle(annotated, (x_start, y_start), (x_end, y_end), colour, 2)

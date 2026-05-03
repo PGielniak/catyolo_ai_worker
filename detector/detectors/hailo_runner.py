@@ -16,6 +16,16 @@ from detector.detectors.base import BaseDetector
 from detector.capture import FrameCapture
 import time
 
+import ctypes
+
+def _set_thread_name(name):
+    """Set the OS-visible thread name (Linux only, max 15 chars)."""
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.prctl(15, name.encode()[:15], 0, 0, 0)  # 15 = PR_SET_NAME
+    except Exception:
+        pass
+
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +283,7 @@ class HailoRunner(BaseDetector):
         return detection_result
 
     def _run(self):
+        _set_thread_name("hailo") 
         try:
             self._setup()
         except Exception:

@@ -12,3 +12,4 @@ wheels/
 /samples
 *.log
 /hefs
+/*samples
