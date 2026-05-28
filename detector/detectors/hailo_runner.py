@@ -19,10 +19,9 @@ import time
 import ctypes
 
 def _set_thread_name(name):
-    """Set the OS-visible thread name (Linux only, max 15 chars)."""
     try:
         libc = ctypes.CDLL("libc.so.6")
-        libc.prctl(15, name.encode()[:15], 0, 0, 0)  # 15 = PR_SET_NAME
+        libc.prctl(15, name.encode()[:15], 0, 0, 0)
     except Exception:
         pass
 
@@ -39,6 +38,7 @@ class YoloDetection:
     class_id: int
     label: str
 
+
 @dataclass
 class YoloResult:
     timestamp: float
@@ -47,12 +47,13 @@ class YoloResult:
 @dataclass
 class HailoResult:
     yolo_result: Optional[YoloResult] = None
+    depth_map: Optional[np.ndarray] = None
+    vlm_answer: Optional[str] = None
 
 class HailoRunner(BaseDetector):
-    """
-    Runs Hailo inference in sequence on a separate thread
-    """
     YOLO_PATH = Path("/mnt/ssd/home/patryk/pycharm/catyolo_ai_worker/hefs/yolov11x.hef")
+    DEPTH_PATH = Path("/mnt/ssd/home/patryk/pycharm/catyolo_ai_worker/hefs/scdepthv3.hef")
+    VLM_PATH = Path("/mnt/ssd/hailo-resources/models/hailo10h/Qwen2-VL-2B-Instruct.hef")
     IDLE_SLEEP = 0.05
     COCO_CLASSES = [
     'person','bicycle','car','motorcycle','airplane','bus','train','truck','boat',
@@ -77,7 +78,6 @@ class HailoRunner(BaseDetector):
 
         self.yolo_classes = yolo_classes
         self._class_ids = [self.COCO_CLASSES.index(c) for c in yolo_classes]
-        # self._yolo = YoloDetection()
         self._setup_complete = threading.Event()
         self._device = None
         self._yolo_infer_model = None
@@ -85,6 +85,16 @@ class HailoRunner(BaseDetector):
         self._desired_h = None
         self._desired_w = None
         self._c = None
+        self._depth_enabled = False
+        self._depth_lock = threading.Lock()
+
+        self._fastdepth_infer_model = None
+        self._fastdepth_configured_infer_model = None
+
+        self._vlm = None
+        self._vlm_request_lock = threading.Lock()
+        self._vlm_request_frame: Optional[np.ndarray] = None
+        self._vlm_request_question: Optional[str] = None
 
 
 
@@ -101,9 +111,9 @@ class HailoRunner(BaseDetector):
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=timeout)
+        self._teardown() 
 
     def _setup(self):
-        """Load models, fetch config, etc. Called once before loop."""
         device_ids = self.get_hailo_device_ids()
         if len(device_ids) < 1:
             message = "No Hailo devices found"
@@ -115,38 +125,86 @@ class HailoRunner(BaseDetector):
 
         params = VDevice.create_params()
         params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
-        params.group_id = "SHARED"  # NOT multi_process_service on Hailo10H
+        params.group_id = "SHARED"
         self._device = VDevice(params)
-        self._yolo_infer_model = self._device.create_infer_model(str(self.YOLO_PATH))
-        input_name = self._yolo_infer_model .input_names[0]
-        desired_h, desired_w, c = self._yolo_infer_model .input(input_name).shape
-        self._desired_h = desired_h
-        self._desired_w = desired_w
-        self._c = c
-        for i in self._yolo_infer_model .input_names:
-            logger.debug(f"input_name {i}")
-            logger.debug(repr(self._yolo_infer_model .input(i)))
-        logger.info(type(self._yolo_infer_model ))
-        h, w, c = self._yolo_infer_model .input(input_name).shape
-        self._yolo_configured_infer_model = self._yolo_infer_model .configure()
 
+        try:
+            self._yolo_infer_model = self._device.create_infer_model(str(self.YOLO_PATH))
+            input_name = self._yolo_infer_model.input_names[0]
+            desired_h, desired_w, c = self._yolo_infer_model .input(input_name).shape
+            self._desired_h = desired_h
+            self._desired_w = desired_w
+            self._c = c
+            for i in self._yolo_infer_model.input_names:
+                logger.debug(f"input_name {i}")
+                logger.debug(repr(self._yolo_infer_model.input(i)))
+            logger.info(type(self._yolo_infer_model ))
+            h, w, c = self._yolo_infer_model.input(input_name).shape
+            self._yolo_configured_infer_model = self._yolo_infer_model.configure()
+            logger.info("Yolo configured")
+        except Exception as e:
+            logger.error(f"Error while creating yolo infer model: {e}")
+            raise e
+
+        try:
+            self._fastdepth_infer_model = self._device.create_infer_model(str(self.DEPTH_PATH))
+            input_name = self._fastdepth_infer_model.input_names[0]
+
+            for i in self._fastdepth_infer_model.input_names:
+                print(f"input_name {i}")
+                print(repr(self._fastdepth_infer_model.input(i)))
+            print(type(self._fastdepth_infer_model))
+            self._fastdepth_desired_h, self._fastdepth_desired_w, self._fastdepth_c = self._fastdepth_infer_model.input(input_name).shape
+            self._fastdepth_configured_infer_model = self._fastdepth_infer_model.configure()
+            logger.info("Depth configured")
+        except Exception as e:
+            logger.error(f"Error while creating fast depth infer model: {e}")
+            raise e
+
+        try:
+            logger.info(f"Loading VLM from {self.VLM_PATH}")
+            self._vlm = VLM(self._device, str(self.VLM_PATH))
+            logger.info("VLM configured")
+        except Exception as e:
+            logger.error(f"Error while creating VLM: {e}")
+            self._vlm = None
+
+
+
+    def set_depth_enabled(self, enabled: bool):
+        with self._depth_lock:
+            self._depth_enabled = enabled
+
+    def request_vlm(self, frame: np.ndarray, question: str):
+        with self._vlm_request_lock:
+            if self._vlm_request_frame is not None:
+                return
+            self._vlm_request_frame = frame.copy()
+            self._vlm_request_question = question
 
     def _teardown(self):
-        """Release device on the same thread that created it."""
         try:
-            if self._device is not None:
+            if hasattr(self, '_yolo_configured_infer_model') and self._yolo_configured_infer_model is not None:
+                del self._yolo_configured_infer_model
+                self._yolo_configured_infer_model = None
+
+            if hasattr(self, '_yolo_infer_model') and self._yolo_infer_model is not None:
+                del self._yolo_infer_model
+                self._yolo_infer_model = None
+
+            if hasattr(self, '_device') and self._device is not None:
                 self._device.release()
-        except Exception:
-            logger.exception("error during Hailo teardown")
+                self._device = None
+        except Exception as e:
+            logger.exception(f"Error during Hailo teardown: {str(e)}")
+
 
         
     def get_latest(self) -> Optional[HailoResult]:
-        """Return the most recent result, or None if no frame has been processed yet."""
         with self._lock:
             return self._latest  
 
     def wait_until_ready(self, timeout: float = 30.0) -> bool:
-        """Block until Hailo setup completes. Returns False on timeout."""
         return self._setup_complete.wait(timeout=timeout)
 
     def get_hailo_device_ids(self):
@@ -159,29 +217,14 @@ class HailoRunner(BaseDetector):
         return ids
 
     def get_hailo_device_info(self, device_id="0001:01:00.0"):
-        """
-        Retrieve detailed information about a Hailo device using the `lspci` command.
-
-        Args:
-            device_id (str): The BDF identifier of the Hailo device (e.g., "0001:01:00.0").
-
-        Returns:
-            str: The output of the `lspci` command for the specified device.
-        """
         try:
-            # Run the `lspci` command and capture the output
             command = ["lspci", "-v", "-s", device_id]
             result = subprocess.run(command, capture_output=True, text=True, check=True)
-
-            # Return the output
             return result.stdout
         except subprocess.CalledProcessError as e:
             return f"Error: {e.stderr}"
 
     def _rescale_image(self, original_image: np.ndarray, desired_size: tuple[int, int]) -> tuple[np.ndarray,int,int,int,int]:
-        """
-        Rescale the image to the desired size while maintaining the aspect ratio.
-        """
         original_height, original_width = original_image.shape[:2]
         desired_height, desired_width = desired_size
 
@@ -213,8 +256,6 @@ class HailoRunner(BaseDetector):
 
 
     def _run_yolo_object_detection(self, image: np.ndarray) -> HailoResult:
-
-        
         original_h, original_w = image.shape[:2]
 
         
@@ -250,9 +291,9 @@ class HailoRunner(BaseDetector):
                 if conf < confidence_threshold:
                     continue
 
-                offset = 0 # 172
+                offset = 0
 
-                x1 = int(x1_n * self._desired_h - offset)   # 0.5 * 640 = 320px
+                x1 = int(x1_n * self._desired_h - offset)
                 y1 = int(y1_n * self._desired_w + offset)
                 x2 = int(x2_n * self._desired_h - offset)
                 y2 = int(y2_n * self._desired_w + offset)
@@ -312,12 +353,102 @@ class HailoRunner(BaseDetector):
 
 
     def _process(self, frame: np.ndarray) -> HailoResult:
-        """Run Yolo Detection on a frame"""
-
         yolo_detections = self._run_yolo_object_detection(image=frame)
 
+        depth_map = None
+        with self._depth_lock:
+            run_depth = self._depth_enabled
+        if run_depth:
+            try:
+                depth_map = self._run_depth_estimation(image=frame)
+            except Exception:
+                logger.exception("Depth estimation failed")
+
+        vlm_answer = None
+        vlm_frame = None
+        vlm_question = None
+        with self._vlm_request_lock:
+            vlm_frame = self._vlm_request_frame
+            vlm_question = self._vlm_request_question
+            self._vlm_request_frame = None
+            self._vlm_request_question = None
+        if vlm_frame is not None and self._vlm is not None:
+            try:
+                vlm_answer = self._run_vlm(vlm_frame, vlm_question)
+                logger.info(f"VLM answer: {vlm_answer}")
+            except Exception:
+                logger.exception("VLM inference failed")
+
         return HailoResult(
-            yolo_result=yolo_detections
+            yolo_result=yolo_detections,
+            depth_map=depth_map,
+            vlm_answer=vlm_answer,
         )
 
+    def _run_vlm(self, frame: np.ndarray, question: str) -> str:
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = cv2.resize(image, (336, 336)).astype(np.uint8)
 
+        prompt = [
+            {"role": "system", "content": [{"type": "text", "text": "You are a helpful assistant that analyzes images and answers questions."}]},
+            {"role": "user", "content": [
+                {"type": "image"},
+                {"type": "text", "text": question}
+            ]}
+        ]
+
+        response = self._vlm.generate_all(
+            prompt=prompt,
+            frames=[image],
+            temperature=0.1,
+            seed=42,
+            max_generated_tokens=50,
+        )
+        clean = response.split(". [{\'type'")[0].split("<|im_end|>")[0].strip()
+        self._vlm.clear_context()
+        return clean
+
+    def _resize_for_depth(self, image: np.ndarray) -> np.ndarray:
+        h, w = image.shape[:2]
+        desired_h = self._fastdepth_desired_h
+        desired_w = self._fastdepth_desired_w
+        scale = min(desired_h / h, desired_w / w)
+        new_h, new_w = int(h * scale), int(w * scale)
+        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        top = (desired_h - new_h) // 2
+        left = (desired_w - new_w) // 2
+        padded = cv2.copyMakeBorder(
+            resized, top, desired_h - new_h - top, left, desired_w - new_w - left,
+            cv2.BORDER_CONSTANT, value=[0, 0, 0]
+        )
+        return padded
+
+    def _run_depth_estimation(self, image: np.ndarray) -> np.ndarray:
+        original_h, original_w = image.shape[:2]
+        input_image = self._resize_for_depth(image)
+        if self._fastdepth_c == 4 and input_image.shape[2] == 3:
+            h_in, w_in, _ = input_image.shape
+            padded = np.zeros((h_in, w_in, 4), dtype=np.uint8)
+            padded[:, :, :3] = input_image
+            input_image = padded
+        input_data = np.ascontiguousarray(input_image, dtype=np.uint8)
+        bindings = self._fastdepth_configured_infer_model.create_bindings()
+        bindings.input(self._fastdepth_infer_model.input_names[0]).set_buffer(input_data)
+        for out_name in self._fastdepth_infer_model.output_names:
+            out_shape = self._fastdepth_infer_model.output(out_name).shape
+            out_format = self._fastdepth_infer_model.output(out_name).format
+            type_str = str(out_format.type)
+            if "UINT8" in type_str:
+                np_dtype = np.uint8
+            elif "UINT16" in type_str:
+                np_dtype = np.uint16
+            elif "FLOAT32" in type_str:
+                np_dtype = np.float32
+            else:
+                np_dtype = np.uint8
+            bindings.output(out_name).set_buffer(np.empty(out_shape, dtype=np_dtype))
+        self._fastdepth_configured_infer_model.run([bindings], timeout=1000)
+        output = bindings.output(out_name).get_buffer()
+        depth_map = output.squeeze()
+        depth_map = cv2.resize(depth_map, (original_w, original_h), interpolation=cv2.INTER_LINEAR)
+        return depth_map
