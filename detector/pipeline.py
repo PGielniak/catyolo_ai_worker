@@ -7,9 +7,9 @@ logger = logging.getLogger(__name__)
 import base64
 import numpy as np
 from datetime import datetime
-from pathlib import Path
 from detector.detectors.occlusion_detectionV2 import OcclusionDetector
 from detector.detectors.hailo_runner import HailoRunner
+from detector.events import DetectionEventEmitter, DetectionEvent
 
 import ctypes
 
@@ -20,8 +20,9 @@ def set_thread_name(name: str):
     except Exception:
         pass
 class DetectionPipeline:
-    VLM_QUESTION = "Is the cat attacking a plant. Answer with Yes or No only"
-    VLM_COOLDOWN_SECONDS = 30
+    VLM_COOLDOWN_SECONDS = 3
+    VLM_MIN_OVERLAP_SECONDS = 1.0
+    DEPTH_MARGIN_DEFAULT = 0.20
 
     def __init__(self, capture, api_base: str):
         self._capture = capture
@@ -33,20 +34,33 @@ class DetectionPipeline:
         self._depth_show = True
         self._depth_show_lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, daemon=True)
-        self.last_saved_sample = None
-        self.last_saved_depth = None
-        self._depth_samples_dir = Path("/mnt/ssd/home/patryk/pycharm/catyolo_ai_worker/samples")
-        self._last_vlm_request = None
+        # Track the last VLM request time per red zone (keyed by zone index) so each
+        # zone is throttled independently and one busy zone can't starve another.
+        self._last_event_by_zone = {}
+        self._overlap_since = {}
+        self._vlm_fired_for_zone = set()
         self._last_vlm_answer = None
+        self._last_vlm_answer_zone = None
+        self._last_vlm_prompt = None
         self._last_vlm_answer_lock = threading.Lock()
+        self._latest_occlusion_result = None
+        self._reference_depths_ok = False
+        self._reference_depths: dict[int, float] = {}
 
         config = self._fetch_config()
         self._scene = config[0]
         reference_image = self._decode_reference(self._scene["image"]["image"])
         red_zones = self._scene["red_zones"]
-        
-        self._vlm_prompt_template = self._scene.get("vlm_prompt") or "Is the {class} attacking a plant? Answer with Yes or No only"
-        
+
+        self._scene_prompt = self._scene.get("scene_prompt")
+        self._scene_prompt_interval = self._scene.get("scene_prompt_interval")
+        self._scene_prompt_action_ids = self._scene.get("scene_prompt_action_ids")
+        self._last_global_vlm_time = 0.0
+        self._last_global_vlm_answer = None
+        self._last_global_vlm_answer_time = None
+        self._pending_vlm_is_global = False
+        self._last_processed_vlm_result = None
+
         all_classes = set()
         for rz in red_zones:
             all_classes.update(rz.get("forbidden_classes", []))
@@ -62,8 +76,12 @@ class DetectionPipeline:
 
         self._hailo_runner = HailoRunner(
             capture=capture,
-            yolo_classes=yolo_classes
+            yolo_classes=yolo_classes,
+            reference_image=reference_image,
+            red_zones=red_zones,
         )
+
+        self._detection_events = DetectionEventEmitter()
 
     def start(self):
         self._thread.start()
@@ -117,82 +135,6 @@ class DetectionPipeline:
 
         
 
-    def _save_overlap_sample(self, raw_frame, annotated_frame, depth_map, timestamp):
-        self._depth_samples_dir.mkdir(parents=True, exist_ok=True)
-        ts = timestamp.strftime("%Y%m%d_%H%M%S")
-
-        raw_target = self._depth_samples_dir / f"{ts}_raw.jpg"
-        annotated_target = self._depth_samples_dir / f"{ts}_annotated.jpg"
-        depth_target = self._depth_samples_dir / f"{ts}_depth.jpg"
-
-        ok1 = cv2.imwrite(str(raw_target), raw_frame)
-        ok2 = cv2.imwrite(str(annotated_target), annotated_frame)
-        if not ok1 or not ok2:
-            logger.error(f"imwrite failed: raw={ok1}, annotated={ok2}")
-
-        if depth_map.dtype != np.uint8:
-            min_val = np.min(depth_map)
-            max_val = np.max(depth_map)
-            if max_val > min_val:
-                depth_8u = ((depth_map - min_val) / (max_val - min_val) * 255).astype(np.uint8)
-            else:
-                depth_8u = np.zeros_like(depth_map, dtype=np.uint8)
-        else:
-            depth_8u = depth_map
-        ok3 = cv2.imwrite(str(depth_target), depth_8u)
-        if not ok3:
-            logger.error(f"imwrite failed for depth")
-        logger.info(f"Overlap samples saved: {ts}")
-
-    def _save_sample(self,img_raw, img_annotated, timestamp):
-        if img_annotated is None:
-            logger.error("img_annotated is None")
-            return
-        
-        output_path = Path("/mnt/ssd/home/patryk/pycharm/catyolo_ai_worker/occl_yolo_samples")
-        output_path.mkdir(parents=True, exist_ok=True)
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        target = output_path / f"{timestamp_str}_annotated.jpg"
-        target_raw = output_path / f"{timestamp_str}_raw.jpg"
-        
-        logger.info(f"saving: type={type(img_annotated).__name__}, "
-                    f"shape={getattr(img_annotated, 'shape', 'N/A')}, "
-                    f"dtype={getattr(img_annotated, 'dtype', 'N/A')}, "
-                    f"contiguous={getattr(img_annotated, 'flags', None) and img_annotated.flags['C_CONTIGUOUS']}")
-
-        logger.info(f"saving: type={type(img_raw).__name__}, "
-                    f"shape={getattr(img_raw, 'shape', 'N/A')}, "
-                    f"dtype={getattr(img_raw, 'dtype', 'N/A')}, "
-                    f"contiguous={getattr(img_raw, 'flags', None) and img_raw.flags['C_CONTIGUOUS']}")
-        
-        try:
-            ok = cv2.imwrite(str(target), img_annotated)
-            ok2 = cv2.imwrite(str(target_raw),img_raw)
-            if not ok:
-                logger.error(f"imwrite returned False for {target}")
-            if not ok2:
-                logger.error(f"imwrite returned False for {target_raw}")
-        except cv2.error as e:
-            logger.error(f"imwrite raised error: {e}")
-
-
-    def _save_vlm_sample(self, annotated_frame, answer, timestamp):
-        self._depth_samples_dir.mkdir(parents=True, exist_ok=True)
-        ts = timestamp.strftime("%Y%m%d_%H%M%S")
-        img_target = self._depth_samples_dir / f"{ts}_vlm_annotated.jpg"
-        txt_target = self._depth_samples_dir / f"{ts}_vlm_result.txt"
-        ok = cv2.imwrite(str(img_target), annotated_frame)
-        if not ok:
-            logger.error(f"imwrite failed for VLM sample")
-        try:
-            with open(txt_target, "w") as f:
-                f.write(f"Prompt: {self.VLM_QUESTION}\n")
-                f.write(f"Answer: {answer}\n")
-                f.write(f"Timestamp: {timestamp.isoformat()}\n")
-        except Exception as e:
-            logger.error(f"Failed to write VLM result file: {e}")
-        logger.info(f"VLM alert sample saved: {ts} — answer: {answer}")
-
     @staticmethod
     def _iou(box1, box2):
         x1 = max(box1[0], box2[0])
@@ -216,18 +158,65 @@ class DetectionPipeline:
         return False
 
     def _check_overlap(self, yolo_result, red_zones):
-        """Returns (overlaps: bool, detected_class: str | None)"""
+        """Returns (zone_index, detected_class) for the first forbidden overlap, else (None, None)."""
         if yolo_result is None or not yolo_result.detections:
-            return False, None
+            return None, None
         for det in yolo_result.detections:
             det_box = (det.x1, det.y1, det.x2, det.y2)
-            for rz in red_zones:
+            for idx, rz in enumerate(red_zones):
                 rz_box = (rz["x"], rz["y"], rz["x"] + rz["width"], rz["y"] + rz["height"])
                 if self._iou(det_box, rz_box) > 0:
                     forbidden = rz.get("forbidden_classes", [])
                     if det.label in forbidden:
-                        return True, det.label
-        return False, None
+                        return idx, det.label
+        return None, None
+
+    def _overlapping_zone_indices(self, yolo_result, red_zones):
+        """Returns {zone_index: first_matching_class} for zones with a forbidden-class bbox overlap."""
+        if yolo_result is None or not yolo_result.detections:
+            return {}
+        hits = {}
+        for det in yolo_result.detections:
+            det_box = (det.x1, det.y1, det.x2, det.y2)
+            for idx, rz in enumerate(red_zones):
+                if idx in hits:
+                    continue
+                rz_box = (rz["x"], rz["y"], rz["x"] + rz["width"], rz["y"] + rz["height"])
+                if self._iou(det_box, rz_box) > 0:
+                    forbidden = rz.get("forbidden_classes", [])
+                    if det.label in forbidden:
+                        hits[idx] = det.label
+        return hits
+
+    def _any_zone_wants_depth(self) -> bool:
+        for rz in self._scene.get("red_zones", []):
+            if rz.get("depth_enabled"):
+                return True
+        return False
+
+    def _check_depth_match(self, zone_idx: int, depth_map, detection_bbox) -> bool:
+        if not self._reference_depths_ok or zone_idx not in self._reference_depths:
+            return True
+        ref_depth = self._reference_depths[zone_idx]
+        zone = self._scene["red_zones"][zone_idx]
+        margin = zone.get("depth_margin") or self.DEPTH_MARGIN_DEFAULT
+
+        x1 = max(0, int(detection_bbox[0]))
+        y1 = max(0, int(detection_bbox[1]))
+        x2 = min(depth_map.shape[1], int(detection_bbox[2]))
+        y2 = min(depth_map.shape[0], int(detection_bbox[3]))
+        if x2 <= x1 or y2 <= y1:
+            return True
+        crop = depth_map[y1:y2, x1:x2]
+        if crop.size == 0:
+            return True
+        bbox_median = float(np.median(crop))
+        diff = abs(bbox_median - ref_depth) / max(abs(ref_depth), 1e-8)
+        if diff > margin:
+            logger.info(f"Depth gate blocked — zone {zone_idx}: "
+                        f"ref={ref_depth:.3f} bbox={bbox_median:.3f} diff={diff:.3f} > margin={margin:.3f}")
+            return False
+        return True
 
     def _run(self):
         set_thread_name("pipeline")
@@ -236,9 +225,8 @@ class DetectionPipeline:
         logger.debug(f"{self._scene['scene_name']}")
         logger.debug(f"{self._scene['camera_ip_address']}")
         logger.debug(f"{self._scene['camera_port']}")
-        logger.debug(f"{self._scene['action_ids']}")
         logger.debug(f"{self._scene['red_zones']}")
-        TARGET_FPS = 60
+        TARGET_FPS = 30
         target_dt = 1.0 / TARGET_FPS
         next_tick = time.monotonic()
 
@@ -257,6 +245,7 @@ class DetectionPipeline:
             result = self._occlusion_detector.process(frame)
 
             if result is not None:
+                self._latest_occlusion_result = result
                 self._draw_occlusion(annotated, result)
 
             yolo_detection = self._hailo_runner.get_latest()
@@ -264,35 +253,122 @@ class DetectionPipeline:
             if yolo_detection is not None:
                 self._draw_yolo_detection(annotated, yolo_detection)
 
-                if yolo_detection.vlm_answer is not None:
+                if yolo_detection.vlm_answer is not None and yolo_detection is not self._last_processed_vlm_result:
+                    self._last_processed_vlm_result = yolo_detection
                     now_vlm = datetime.now()
                     answer = yolo_detection.vlm_answer
                     with self._last_vlm_answer_lock:
                         self._last_vlm_answer = (answer, now_vlm)
                     logger.info(f"VLM result received: '{answer}'")
-                    if "yes" in answer.lower():
-                        cv2.putText(annotated, f"VLM: {answer}", (10, 30),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                        self._save_vlm_sample(annotated, answer, now_vlm)
+                    self._draw_vlm_answer(annotated, answer, self._last_vlm_answer_zone, question=self._last_vlm_prompt)
+
+                    if self._pending_vlm_is_global:
+                        self._pending_vlm_is_global = False
+                        if answer == "Yes":
+                            self._detection_events.emit(DetectionEvent(
+                                annotated_image=annotated.copy(),
+                                trigger="global_prompt",
+                                vlm_prompt=self._last_vlm_prompt or "",
+                                vlm_answer=answer,
+                                timestamp=now_vlm,
+                                zone=None,
+                            ))
+                    elif "yes" in answer.lower():
+                        det_class = self._last_vlm_answer_zone.get("forbidden_classes", [])[0] if isinstance(self._last_vlm_answer_zone, dict) and self._last_vlm_answer_zone.get("forbidden_classes") else None
+                        self._detection_events.emit(DetectionEvent(
+                            annotated_image=annotated.copy(),
+                            trigger="vlm_yes",
+                            detected_class=det_class,
+                            vlm_prompt=self._last_vlm_prompt or "",
+                            vlm_answer=answer,
+                            timestamp=now_vlm,
+                            zone=self._last_vlm_answer_zone,
+                        ))
 
                 if yolo_detection.yolo_result is not None:
-                    depth_on = self.get_depth_show()
+                    depth_on = self.get_depth_show() or self._any_zone_wants_depth()
                     self._hailo_runner.set_depth_enabled(depth_on)
 
-                    overlap, detected_class = self._check_overlap(yolo_detection.yolo_result, red_zones)
-                    if overlap and detected_class:
-                        now_vlm = time.monotonic()
-                        if self._last_vlm_request is None or (now_vlm - self._last_vlm_request) >= self.VLM_COOLDOWN_SECONDS:
-                            prompt = self._vlm_prompt_template.replace("{class}", detected_class)
-                            logger.info(f"Class-aware overlap ({detected_class}) — VLM prompt: {prompt}")
-                            self._hailo_runner.request_vlm(frame, prompt)
-                            self._last_vlm_request = now_vlm
+                    if not self._reference_depths_ok:
+                        ready, ref_depths = self._hailo_runner.get_reference_depths(timeout=0.0)
+                        if ready:
+                            self._reference_depths = ref_depths
+                            self._reference_depths_ok = True
 
-                    if yolo_detection.depth_map is not None:
-                        now_d = datetime.now()
-                        if self.last_saved_depth is None or (now_d - self.last_saved_depth).total_seconds() >= 30:
-                            self._save_overlap_sample(frame, annotated, yolo_detection.depth_map, now_d)
-                            self.last_saved_depth = now_d
+                    now_vlm = time.monotonic()
+                    overlapping_now = self._overlapping_zone_indices(yolo_detection.yolo_result, red_zones)
+
+                    for zi in list(self._overlap_since):
+                        if zi not in overlapping_now:
+                            self._overlap_since.pop(zi, None)
+                            self._vlm_fired_for_zone.discard(zi)
+
+                    for zi, detected_class in overlapping_now.items():
+                        if zi not in self._overlap_since:
+                            self._overlap_since[zi] = now_vlm
+                        elif zi not in self._vlm_fired_for_zone:
+                            elapsed = now_vlm - self._overlap_since[zi]
+                            if elapsed >= self.VLM_MIN_OVERLAP_SECONDS:
+                                last_request = self._last_event_by_zone.get(zi)
+                                if last_request is None or (now_vlm - last_request) >= self.VLM_COOLDOWN_SECONDS:
+                                    zone = red_zones[zi]
+
+                                    zone_occluded = False
+                                    if (self._latest_occlusion_result is not None and
+                                        zi < len(self._latest_occlusion_result.zones)):
+                                        rz = self._latest_occlusion_result.zones[zi]
+                                        if rz.get("occluded"):
+                                            zone_occluded = True
+                                            logger.info(f"Occlusion gate blocked — zone {zi} is occluded "
+                                                        f"(score={rz.get('occlusion_score', 0):.2f})")
+                                    if zone_occluded:
+                                        continue
+
+                                    if not zone.get("vlm_prompt"):
+                                        if zone.get("depth_enabled") and yolo_detection.depth_map is not None:
+                                            det_box = None
+                                            for det in yolo_detection.yolo_result.detections:
+                                                if det.label == detected_class:
+                                                    det_box = (det.x1, det.y1, det.x2, det.y2)
+                                                    break
+                                            if det_box and not self._check_depth_match(zi, yolo_detection.depth_map, det_box):
+                                                continue
+                                            trigger = "depth_match"
+                                        else:
+                                            trigger = "overlap"
+                                        logger.info(f"DetectionEvent trigger — zone {zi} overlapped for {elapsed:.1f}s, class={detected_class}, trigger={trigger}")
+                                        self._detection_events.emit(DetectionEvent(
+                                            annotated_image=annotated.copy(),
+                                            trigger=trigger,
+                                            detected_class=detected_class,
+                                            timestamp=datetime.now(),
+                                            zone=zone,
+                                        ))
+                                        self._last_event_by_zone[zi] = now_vlm
+                                        self._last_vlm_answer_zone = zone
+                                        self._last_vlm_prompt = ""
+                                        self._vlm_fired_for_zone.add(zi)
+                                        self._pending_vlm_is_global = False
+                                        continue
+
+                                    if zone.get("depth_enabled") and yolo_detection.depth_map is not None:
+                                        det_box = None
+                                        for det in yolo_detection.yolo_result.detections:
+                                            if det.label == detected_class:
+                                                det_box = (det.x1, det.y1, det.x2, det.y2)
+                                                break
+                                        if det_box and not self._check_depth_match(zi, yolo_detection.depth_map, det_box):
+                                            continue
+
+                                    prompt_template = zone.get("vlm_prompt") or "Is the {class} attacking a plant?"
+                                    prompt = prompt_template.replace("{class}", detected_class)
+                                    logger.info(f"VLM trigger — zone {zi} overlapped for {elapsed:.1f}s, class={detected_class}")
+                                    self._hailo_runner.request_vlm(frame, zone=zone, detected_class=detected_class)
+                                    self._last_event_by_zone[zi] = now_vlm
+                                    self._last_vlm_answer_zone = zone
+                                    self._last_vlm_prompt = prompt
+                                    self._vlm_fired_for_zone.add(zi)
+                                    self._pending_vlm_is_global = False
 
                     depth_map = yolo_detection.depth_map
                     if depth_map is not None:
@@ -304,6 +380,24 @@ class DetectionPipeline:
                         depth_color = cv2.applyColorMap(depth_8u, cv2.COLORMAP_INFERNO)
                         with self._depth_viz_lock:
                             self._depth_viz = depth_color
+
+            if (self._scene_prompt
+                    and self._scene_prompt_interval
+                    and self._scene_prompt_interval > 0):
+                now_mono = time.monotonic()
+                if (now_mono - self._last_global_vlm_time) >= self._scene_prompt_interval:
+                    logger.info(f"Global VLM trigger — interval={self._scene_prompt_interval}s")
+                    self._hailo_runner.request_vlm(
+                        frame,
+                        zone=None,
+                        detected_class=None,
+                        is_global=True,
+                        global_prompt=self._scene_prompt,
+                    )
+                    self._last_global_vlm_time = now_mono
+                    self._last_vlm_answer_zone = None
+                    self._last_vlm_prompt = self._scene_prompt
+                    self._pending_vlm_is_global = True
 
 
 
@@ -317,8 +411,8 @@ class DetectionPipeline:
             vlm_display = self.get_last_vlm_answer()
             if vlm_display is not None:
                 answer, ts = vlm_display
-                cv2.putText(annotated, f"VLM: {answer}", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                self._draw_vlm_answer(annotated, answer, self._last_vlm_answer_zone,
+                                      question=self._last_vlm_prompt, color=(255, 255, 255))
 
             with self._annotated_lock:
                 self._annotated = annotated
@@ -331,6 +425,28 @@ class DetectionPipeline:
                 next_tick = time.monotonic()
 
         
+    def _draw_vlm_answer(self, annotated, answer, zone, question=None, color=(255, 255, 255)):
+        x = zone.get("x", 10) if zone else 10
+        y = zone.get("y", 30) if zone else 30
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.5
+        thickness = 1
+        lines = []
+        if question:
+            lines.append(("Q: " + question, (200, 200, 200)))
+        lines.append(("VLM: " + answer, color))
+
+        text_x = x + 4
+        text_y = max(y - 22, 14)
+        for text, clr in reversed(lines):
+            (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+            text_y -= th + 6
+            cv2.rectangle(annotated, (text_x - 3, text_y - 2),
+                          (text_x + tw + 3, text_y + th + baseline + 2),
+                          (0, 0, 0), -1)
+            cv2.putText(annotated, text, (text_x, text_y + th),
+                        font, scale, clr, thickness)
+
     def _draw_occlusion(self, annotated, result):
         for rz in result.zones:
             x_start = rz['x']

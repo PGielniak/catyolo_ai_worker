@@ -50,10 +50,23 @@ class HailoResult:
     depth_map: Optional[np.ndarray] = None
     vlm_answer: Optional[str] = None
 
+
+@dataclass
+class VlmRequest:
+    """Overlap data handed from the pipeline to the Hailo runner so the runner can
+    build and run the proper VLM call (overlap detection itself stays in the pipeline)."""
+    frame: np.ndarray
+    zone: Optional[dict]
+    detected_class: Optional[str]
+    is_global: bool = False
+    global_prompt: Optional[str] = None
+
+
 class HailoRunner(BaseDetector):
     YOLO_PATH = Path("/mnt/ssd/home/patryk/pycharm/catyolo_ai_worker/hefs/yolov11x.hef")
     DEPTH_PATH = Path("/mnt/ssd/home/patryk/pycharm/catyolo_ai_worker/hefs/scdepthv3.hef")
-    VLM_PATH = Path("/mnt/ssd/hailo-resources/models/hailo10h/Qwen2-VL-2B-Instruct.hef")
+    VLM_PATH = Path("/mnt/ssd/hailo-ollama-models/Qwen3-VL-2B-Instruct.hef")
+    DEFAULT_VLM_PROMPT = "Is the {class} attacking a plant?"
     IDLE_SLEEP = 0.05
     COCO_CLASSES = [
     'person','bicycle','car','motorcycle','airplane','bus','train','truck','boat',
@@ -68,7 +81,8 @@ class HailoRunner(BaseDetector):
     'refrigerator','book','clock','vase','scissors','teddy bear','hair drier',
     'toothbrush'
 ]
-    def __init__(self, capture: FrameCapture, yolo_classes: list[str]):
+    def __init__(self, capture: FrameCapture, yolo_classes: list[str],
+                 reference_image: Optional[np.ndarray] = None, red_zones: Optional[list] = None):
         self._capture = capture
 
         self._stop_event = threading.Event()
@@ -93,8 +107,12 @@ class HailoRunner(BaseDetector):
 
         self._vlm = None
         self._vlm_request_lock = threading.Lock()
-        self._vlm_request_frame: Optional[np.ndarray] = None
-        self._vlm_request_question: Optional[str] = None
+        self._vlm_request: Optional[VlmRequest] = None
+
+        self._reference_image = reference_image
+        self._red_zones = red_zones
+        self._reference_depths: dict[int, float] = {}
+        self._reference_depths_ready = threading.Event()
 
 
 
@@ -175,12 +193,61 @@ class HailoRunner(BaseDetector):
         with self._depth_lock:
             self._depth_enabled = enabled
 
-    def request_vlm(self, frame: np.ndarray, question: str):
-        with self._vlm_request_lock:
-            if self._vlm_request_frame is not None:
+    def get_reference_depths(self, timeout: float = 60.0) -> tuple[bool, dict[int, float]]:
+        ready = self._reference_depths_ready.wait(timeout=timeout)
+        with self._lock:
+            return ready, dict(self._reference_depths)
+
+    def _compute_reference_depths(self):
+        if self._reference_image is None or self._red_zones is None:
+            self._reference_depths_ready.set()
+            return
+        try:
+            logger.info("Computing reference depth map for %d red zones", len(self._red_zones))
+            depth_map = self._run_depth_estimation(self._reference_image)
+            if depth_map is None:
+                logger.warning("Reference depth map is None, skipping per-zone reference depths")
+                self._reference_depths_ready.set()
                 return
-            self._vlm_request_frame = frame.copy()
-            self._vlm_request_question = question
+            for idx, rz in enumerate(self._red_zones):
+                x = max(0, int(rz["x"]))
+                y = max(0, int(rz["y"]))
+                w = int(rz["width"])
+                h = int(rz["height"])
+                x2 = min(depth_map.shape[1], x + w)
+                y2 = min(depth_map.shape[0], y + h)
+                if x2 <= x or y2 <= y:
+                    logger.warning("Zone %d has zero-area crop, skipping reference depth", idx)
+                    continue
+                crop = depth_map[y:y2, x:x2]
+                if crop.size > 0:
+                    self._reference_depths[idx] = float(np.median(crop))
+            logger.info("Reference depths computed: %s", self._reference_depths)
+        except Exception:
+            logger.exception("Failed to compute reference depth map")
+        self._reference_depths_ready.set()
+
+    def request_vlm(self, frame: np.ndarray, zone: Optional[dict], detected_class: Optional[str],
+                    is_global: bool = False, global_prompt: Optional[str] = None):
+        """Queue a VLM call. For zone-based requests, zone and detected_class are required.
+        For global prompt requests, set is_global=True and pass global_prompt."""
+        with self._vlm_request_lock:
+            if self._vlm_request is not None:
+                return
+            self._vlm_request = VlmRequest(
+                frame=frame.copy(),
+                zone=zone,
+                detected_class=detected_class,
+                is_global=is_global,
+                global_prompt=global_prompt,
+            )
+
+    def _resolve_prompt(self, request: VlmRequest) -> str:
+        if request.is_global and request.global_prompt:
+            return request.global_prompt + "\nAnswer with only 'Yes' or 'No':"
+        prompt_template = (request.zone.get("vlm_prompt") if request.zone else None) or self.DEFAULT_VLM_PROMPT
+        question = prompt_template.replace("{class}", request.detected_class or "")
+        return question + "\nAnswer with only 'Yes' or 'No':"
 
     def _teardown(self):
         try:
@@ -332,6 +399,7 @@ class HailoRunner(BaseDetector):
             return
         
         self._setup_complete.set()
+        self._compute_reference_depths()
         logger.info("HailoPipeline running")
         
         while not self._stop_event.is_set():
@@ -358,23 +426,21 @@ class HailoRunner(BaseDetector):
         depth_map = None
         with self._depth_lock:
             run_depth = self._depth_enabled
-        if run_depth:
+        if run_depth or not self._reference_depths_ready.is_set():
             try:
                 depth_map = self._run_depth_estimation(image=frame)
             except Exception:
                 logger.exception("Depth estimation failed")
 
         vlm_answer = None
-        vlm_frame = None
-        vlm_question = None
         with self._vlm_request_lock:
-            vlm_frame = self._vlm_request_frame
-            vlm_question = self._vlm_request_question
-            self._vlm_request_frame = None
-            self._vlm_request_question = None
-        if vlm_frame is not None and self._vlm is not None:
+            request = self._vlm_request
+            self._vlm_request = None
+        if request is not None and self._vlm is not None:
             try:
-                vlm_answer = self._run_vlm(vlm_frame, vlm_question)
+                prompt = self._resolve_prompt(request)
+                logger.info(f"Running VLM — prompt: {prompt}")
+                vlm_answer = self._run_vlm(request.frame, prompt)
                 logger.info(f"VLM answer: {vlm_answer}")
             except Exception:
                 logger.exception("VLM inference failed")
@@ -387,26 +453,42 @@ class HailoRunner(BaseDetector):
 
     def _run_vlm(self, frame: np.ndarray, question: str) -> str:
         image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        image = cv2.resize(image, (336, 336)).astype(np.uint8)
+        # Qwen3-VL-2B expects 288x512 (HxW); Qwen2 used 336x336
+        image = cv2.resize(image, (512, 288)).astype(np.uint8)
 
         prompt = [
-            {"role": "system", "content": [{"type": "text", "text": "You are a helpful assistant that analyzes images and answers questions."}]},
+            {"role": "system", "content": "You are a visual analyst. Look carefully at the image and answer Yes or No based on what you actually see. Do not guess — if you cannot determine, answer No."},
             {"role": "user", "content": [
-                {"type": "image"},
-                {"type": "text", "text": question}
+                {"type": "text", "text": question},
+                {"type": "image"}
             ]}
         ]
 
-        response = self._vlm.generate_all(
-            prompt=prompt,
-            frames=[image],
-            temperature=0.1,
-            seed=42,
-            max_generated_tokens=50,
-        )
-        clean = response.split(". [{\'type'")[0].split("<|im_end|>")[0].strip()
+        # clear_context before generate_all so system role lands on a fresh context;
+        # also clear on failure to avoid a permanent dirty-context loop
         self._vlm.clear_context()
-        return clean
+        try:
+            response = self._vlm.generate_all(
+                prompt=prompt,
+                frames=[image],
+                temperature=0.1,
+                max_generated_tokens=100,
+            )
+        except Exception:
+            self._vlm.clear_context()
+            raise
+        logger.info(f"VLM raw response: {repr(response)}")
+        # Strip Qwen3 thinking block <think>...</think> if present
+        import re
+        answer_text = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
+        if not answer_text:
+            answer_text = response
+        clean = answer_text.split("<|im_end|>")[0].split("<|endoftext|>")[0].strip()
+        clean_lower = clean.lower().rstrip(".,;:!?")
+        logger.info(f"VLM parsed answer: {repr(clean_lower)}")
+        if clean_lower.startswith("yes"):
+            return "Yes"
+        return "No"
 
     def _resize_for_depth(self, image: np.ndarray) -> np.ndarray:
         h, w = image.shape[:2]
