@@ -242,28 +242,50 @@ class HailoRunner(BaseDetector):
                 global_prompt=global_prompt,
             )
 
+    GLOBAL_DESCRIPTION_PROMPT = "Describe what you see in this image in one sentence."
+
     def _resolve_prompt(self, request: VlmRequest) -> str:
-        if request.is_global and request.global_prompt:
-            return request.global_prompt + "\nAnswer with only 'Yes' or 'No':"
+        if request.is_global:
+            return self.GLOBAL_DESCRIPTION_PROMPT
         prompt_template = (request.zone.get("vlm_prompt") if request.zone else None) or self.DEFAULT_VLM_PROMPT
         question = prompt_template.replace("{class}", request.detected_class or "")
-        return question + "\nAnswer with only 'Yes' or 'No':"
-
+        return question + "Answer with only 'Yes' or 'No':"
     def _teardown(self):
+        """Release all infer models and the VDevice. Must be called only after
+        the runner's thread has fully exited (via stop()), and callers should
+        give HailoRT a brief settle delay afterwards before opening a new
+        VDevice — see DetectionPipeline.reload_config()."""
+        # Order matters: release sub-models first, then the VDevice.
+        # Releasing the VDevice while a sub-model is still in use produces
+        # HAILO_STREAM_NOT_ACTIVATED(72) and "Lost communication with the server".
+        for attr in (
+            "_vlm",
+            "_yolo_configured_infer_model",
+            "_yolo_infer_model",
+            "_fastdepth_configured_infer_model",
+            "_fastdepth_infer_model",
+        ):
+            try:
+                if hasattr(self, attr) and getattr(self, attr) is not None:
+                    obj = getattr(self, attr)
+                    # InferModel / ConfiguredInferModel don't expose release();
+                    # just del the reference and let the C++ object destruct.
+                    if attr == "_vlm" and hasattr(obj, "release"):
+                        try:
+                            obj.release()
+                        except Exception:
+                            logger.debug(f"Ignored error releasing {attr}", exc_info=True)
+                    del obj
+                    setattr(self, attr, None)
+            except Exception:
+                logger.exception(f"Error releasing {attr}")
+
         try:
-            if hasattr(self, '_yolo_configured_infer_model') and self._yolo_configured_infer_model is not None:
-                del self._yolo_configured_infer_model
-                self._yolo_configured_infer_model = None
-
-            if hasattr(self, '_yolo_infer_model') and self._yolo_infer_model is not None:
-                del self._yolo_infer_model
-                self._yolo_infer_model = None
-
-            if hasattr(self, '_device') and self._device is not None:
+            if hasattr(self, "_device") and self._device is not None:
                 self._device.release()
                 self._device = None
-        except Exception as e:
-            logger.exception(f"Error during Hailo teardown: {str(e)}")
+        except Exception:
+            logger.exception("Error releasing VDevice")
 
 
         
@@ -440,7 +462,7 @@ class HailoRunner(BaseDetector):
             try:
                 prompt = self._resolve_prompt(request)
                 logger.info(f"Running VLM — prompt: {prompt}")
-                vlm_answer = self._run_vlm(request.frame, prompt)
+                vlm_answer = self._run_vlm(request.frame, prompt, is_global=request.is_global)
                 logger.info(f"VLM answer: {vlm_answer}")
             except Exception:
                 logger.exception("VLM inference failed")
@@ -451,42 +473,53 @@ class HailoRunner(BaseDetector):
             vlm_answer=vlm_answer,
         )
 
-    def _run_vlm(self, frame: np.ndarray, question: str) -> str:
+    def _run_vlm(self, frame: np.ndarray, question: str, is_global: bool = False) -> str:
         image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         # Qwen3-VL-2B expects 288x512 (HxW); Qwen2 used 336x336
         image = cv2.resize(image, (512, 288)).astype(np.uint8)
 
+        if is_global:
+            system_msg = "You are a visual analyst. Describe only what you actually see. Be brief, don't use too many adjectives"
+            max_tokens = 200
+        else:
+            system_msg = (
+                "You are a visual analyst. Look carefully at the image. "
+                "Answer the question with Yes or No as your very first word, "
+                "then optionally explain briefly."
+            )
+            max_tokens = 20
+
         prompt = [
-            {"role": "system", "content": "You are a visual analyst. Look carefully at the image and answer Yes or No based on what you actually see. Do not guess — if you cannot determine, answer No."},
+            {"role": "system", "content": system_msg},
             {"role": "user", "content": [
                 {"type": "text", "text": question},
                 {"type": "image"}
             ]}
         ]
 
-        # clear_context before generate_all so system role lands on a fresh context;
-        # also clear on failure to avoid a permanent dirty-context loop
         self._vlm.clear_context()
         try:
             response = self._vlm.generate_all(
                 prompt=prompt,
                 frames=[image],
                 temperature=0.1,
-                max_generated_tokens=100,
+                max_generated_tokens=max_tokens,
             )
         except Exception:
             self._vlm.clear_context()
             raise
-        logger.info(f"VLM raw response: {repr(response)}")
-        # Strip Qwen3 thinking block <think>...</think> if present
+
         import re
-        answer_text = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
-        if not answer_text:
-            answer_text = response
-        clean = answer_text.split("<|im_end|>")[0].split("<|endoftext|>")[0].strip()
-        clean_lower = clean.lower().rstrip(".,;:!?")
-        logger.info(f"VLM parsed answer: {repr(clean_lower)}")
-        if clean_lower.startswith("yes"):
+        answer_text = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
+        answer_text = answer_text.split("<|im_end|>")[0].split("<|endoftext|>")[0].strip()
+
+        if is_global:
+            logger.info(f"VLM description: {repr(answer_text[:120])}")
+            return answer_text
+
+        first_word = answer_text.split()[0].lower().rstrip(".,;:!?") if answer_text.split() else ""
+        logger.info(f"VLM response={repr(answer_text[:60])} -> {first_word}")
+        if first_word == "yes":
             return "Yes"
         return "No"
 

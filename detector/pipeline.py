@@ -10,6 +10,7 @@ from datetime import datetime
 from detector.detectors.occlusion_detectionV2 import OcclusionDetector
 from detector.detectors.hailo_runner import HailoRunner
 from detector.events import DetectionEventEmitter, DetectionEvent
+from detector.config import SceneConfig
 
 import ctypes
 
@@ -23,8 +24,17 @@ class DetectionPipeline:
     VLM_COOLDOWN_SECONDS = 3
     VLM_MIN_OVERLAP_SECONDS = 1.0
     DEPTH_MARGIN_DEFAULT = 0.20
+    # How long to wait for occlusion / hailo threads to stop on reload.
+    RELOAD_STOP_TIMEOUT = 5.0
+    # HailoRT needs a moment after VDevice.release() before a new VDevice can
+    # be opened on the same device. Without this, the new runner's _setup()
+    # hits HAILO_DEVICE_TEMPORARILY_UNAVAILABLE(97) and dies.
+    HAILO_RELOAD_SETTLE_SECONDS = 2.0
+    # How long the new Hailo runner is allowed to spend in _setup() before
+    # we consider the reload failed. The actual NPU bind takes ~10s on Pi.
+    HAILO_SETUP_TIMEOUT = 60.0
 
-    def __init__(self, capture, api_base: str):
+    def __init__(self, capture, api_base: str, initial_config: SceneConfig):
         self._capture = capture
         self._api_base = api_base
         self._annotated = None
@@ -34,59 +44,195 @@ class DetectionPipeline:
         self._depth_show = True
         self._depth_show_lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, daemon=True)
-        # Track the last VLM request time per red zone (keyed by zone index) so each
-        # zone is throttled independently and one busy zone can't starve another.
+
+        # --- single source of truth for live config ---------------------------
+        # _current_config is a frozen SceneConfig snapshot. The hot loop reads
+        # it once per frame under _config_lock and uses the snapshot for the
+        # rest of the iteration. reload_config() swaps it atomically.
+        self._config_lock = threading.Lock()
+        self._current_config: SceneConfig = initial_config
+        # Serializes reload_config() calls so two reloads can't race.
+        self._reload_lock = threading.Lock()
+
+        # Per-zone throttling state — keyed by zone index. Lives on the
+        # pipeline (not the config) because it's runtime state, not config.
+        # Cleared on every reload so old indices don't leak into new zones.
         self._last_event_by_zone = {}
         self._overlap_since = {}
         self._vlm_fired_for_zone = set()
+
+        # VLM result bookkeeping
         self._last_vlm_answer = None
         self._last_vlm_answer_zone = None
         self._last_vlm_prompt = None
+        self._last_vlm_frame: np.ndarray | None = None
         self._last_vlm_answer_lock = threading.Lock()
+        self._last_processed_vlm_result = None
+
+        # Global-scene-prompt bookkeeping
+        self._last_global_vlm_time = 0.0
+        self._pending_vlm_is_global = False
+
+        # Reference depths — read from the hailo runner as it finishes
+        # computing them.
         self._latest_occlusion_result = None
         self._reference_depths_ok = False
         self._reference_depths: dict[int, float] = {}
 
-        config = self._fetch_config()
-        self._scene = config[0]
-        reference_image = self._decode_reference(self._scene["image"]["image"])
-        red_zones = self._scene["red_zones"]
-
-        self._scene_prompt = self._scene.get("scene_prompt")
-        self._scene_prompt_interval = self._scene.get("scene_prompt_interval")
-        self._scene_prompt_action_ids = self._scene.get("scene_prompt_action_ids")
-        self._last_global_vlm_time = 0.0
-        self._last_global_vlm_answer = None
-        self._last_global_vlm_answer_time = None
-        self._pending_vlm_is_global = False
-        self._last_processed_vlm_result = None
-
-        all_classes = set()
-        for rz in red_zones:
-            all_classes.update(rz.get("forbidden_classes", []))
-        yolo_classes = list(all_classes) if all_classes else ["cat"]
-        logger.info(f"YOLO classes from scene config: {yolo_classes}")
-
-        
-        self._occlusion_detector = OcclusionDetector(
-            capture=capture,
-            reference_image=reference_image,
-            red_zones=red_zones,
-        )
-
-        self._hailo_runner = HailoRunner(
-            capture=capture,
-            yolo_classes=yolo_classes,
-            reference_image=reference_image,
-            red_zones=red_zones,
-        )
+        # Build the first set of detectors from the initial config
+        self._occlusion_detector = self._build_occlusion(initial_config)
+        self._hailo_runner = self._build_hailo(initial_config)
 
         self._detection_events = DetectionEventEmitter()
+
+    # ------------------------------------------------------------------ #
+    # Construction helpers
+    # ------------------------------------------------------------------ #
+
+    def _build_occlusion(self, cfg: SceneConfig) -> OcclusionDetector:
+        if cfg.reference_image is None:
+            raise RuntimeError("Initial scene config has no reference image; cannot build OcclusionDetector")
+        return OcclusionDetector(
+            capture=self._capture,
+            reference_image=cfg.reference_image,
+            red_zones=cfg.red_zones,
+        )
+
+    def _build_hailo(self, cfg: SceneConfig) -> HailoRunner:
+        return HailoRunner(
+            capture=self._capture,
+            yolo_classes=cfg.forbidden_classes,
+            reference_image=cfg.reference_image,
+            red_zones=cfg.red_zones,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
+
+    def subscribe(self, handler):
+        self._detection_events.subscribe(handler)
 
     def start(self):
         self._thread.start()
         self._hailo_runner.start()
+        # The occlusion detector is driven inline from the pipeline thread
+        # (see _run -> occlusion.process(frame)). Its own background thread
+        # is not used in the current architecture, so we don't call .start()
+        # on it.
 
+    def reload_config(self, new_config: SceneConfig):
+        """Atomically replace the running config, rebuilding the occlusion
+        detector and the Hailo runner so the new reference image, red zone
+        geometry, and forbidden-class set all take effect.
+
+        Safe to call from any thread. Concurrent reloads are serialized; the
+        in-flight reload blocks until this one completes. Reloads are also
+        safe to call before start() — in that case we just swap the
+        references and the next start() will use the new instances.
+        """
+        # Serialize concurrent reload requests. If another reload is in flight,
+        # just drop this one — the in-flight one will pick up the same new
+        # config (or a newer one on the next tick).
+        if not self._reload_lock.acquire(blocking=False):
+            logger.debug("Reload already in progress; skipping this tick")
+            return
+        try:
+            old_version = self._current_config.version
+            logger.info(
+                "Reloading scene config — version %s -> %s, scene_id=%s, zones=%d, classes=%s",
+                old_version,
+                new_config.version,
+                new_config.scene.get("scene_id"),
+                len(new_config.red_zones),
+                new_config.forbidden_classes,
+            )
+
+            if new_config.reference_image is None:
+                logger.warning(
+                    "Refusing to reload: new config has no reference image (scene_id=%s)",
+                    new_config.scene.get("scene_id"),
+                )
+                return
+
+            # ---- Tear down old detectors ----
+            try:
+                if self._hailo_runner is not None:
+                    self._hailo_runner.stop(timeout=self.RELOAD_STOP_TIMEOUT)
+            except Exception:
+                logger.exception("Error stopping HailoRunner during reload")
+            try:
+                if self._occlusion_detector is not None:
+                    self._occlusion_detector.stop(timeout=self.RELOAD_STOP_TIMEOUT)
+            except Exception:
+                logger.exception("Error stopping OcclusionDetector during reload")
+
+            # HailoRT needs a brief settle window after VDevice.release() before
+            # a new VDevice can be opened on the same physical device. Without
+            # this the new runner's _setup() fails with
+            # HAILO_DEVICE_TEMPERARILY_UNAVAILABLE(97).
+            if self.HAILO_RELOAD_SETTLE_SECONDS > 0:
+                logger.info(
+                    "Settling for %.1fs before re-opening Hailo device",
+                    self.HAILO_RELOAD_SETTLE_SECONDS,
+                )
+                time.sleep(self.HAILO_RELOAD_SETTLE_SECONDS)
+
+            # ---- Build new detectors ----
+            try:
+                new_occlusion = self._build_occlusion(new_config)
+                new_hailo = self._build_hailo(new_config)
+            except Exception:
+                logger.exception("Failed to build new detectors; aborting reload")
+                return
+
+            # ---- Reset per-zone throttling so old indices don't bleed in ----
+            self._last_event_by_zone = {}
+            self._overlap_since = {}
+            self._vlm_fired_for_zone = set()
+            self._reference_depths = {}
+            self._reference_depths_ok = False
+            self._last_processed_vlm_result = None
+            with self._last_vlm_answer_lock:
+                self._last_vlm_answer = None
+            self._last_vlm_answer_zone = None
+            self._last_vlm_prompt = None
+            self._last_vlm_frame = None
+            self._pending_vlm_is_global = False
+
+            # ---- Atomic swap ----
+            with self._config_lock:
+                self._current_config = new_config
+                self._occlusion_detector = new_occlusion
+                self._hailo_runner = new_hailo
+
+            # ---- Start new threads (no-op if start() was never called) ----
+            try:
+                new_hailo.start()
+            except Exception:
+                logger.exception("Error starting new HailoRunner")
+            # Occlusion detector is driven inline; no background thread to start.
+
+            # Wait for the new runner to actually finish binding to the NPU
+            # before declaring the reload complete. If setup fails, log it and
+            # back out so the user sees a real error instead of silent no-detection.
+            if hasattr(new_hailo, "wait_until_ready"):
+                ready = new_hailo.wait_until_ready(timeout=self.HAILO_SETUP_TIMEOUT)
+                if not ready:
+                    logger.error(
+                        "HailoRunner did not finish setup within %.0fs after reload; "
+                        "detection will not run until the worker is restarted",
+                        self.HAILO_SETUP_TIMEOUT,
+                    )
+
+            logger.info(
+                "Scene config reload complete — version=%s zones=%d classes=%s",
+                new_config.version,
+                len(new_config.red_zones),
+                new_config.forbidden_classes,
+            )
+        finally:
+            self._reload_lock.release()
 
     def set_depth_show(self, enabled: bool):
         with self._depth_show_lock:
@@ -108,17 +254,6 @@ class DetectionPipeline:
         with self._last_vlm_answer_lock:
             return self._last_vlm_answer
 
-    def _fetch_config(self) -> dict:
-        try:
-            logger.info(f"Fetching config from {self._api_base}/scene")
-            r = requests.get(f"{self._api_base}/scene")
-            r.raise_for_status()
-            logger.debug(f"{r.json()}")
-            return r.json()
-        except Exception as e:
-            logger.error(f"Failed to fetch config: {e}")
-            raise
-
     @staticmethod
     def _decode_reference(b64: str) -> np.ndarray:
         try:
@@ -132,8 +267,6 @@ class DetectionPipeline:
             return img
         except Exception as e:
             logger.error(f"Failed to decode reference image")
-
-        
 
     @staticmethod
     def _iou(box1, box2):
@@ -188,17 +321,19 @@ class DetectionPipeline:
                         hits[idx] = det.label
         return hits
 
-    def _any_zone_wants_depth(self) -> bool:
-        for rz in self._scene.get("red_zones", []):
+    def _any_zone_wants_depth(self, red_zones) -> bool:
+        for rz in red_zones:
             if rz.get("depth_enabled"):
                 return True
         return False
 
-    def _check_depth_match(self, zone_idx: int, depth_map, detection_bbox) -> bool:
+    def _check_depth_match(self, zone_idx: int, red_zones, depth_map, detection_bbox) -> bool:
         if not self._reference_depths_ok or zone_idx not in self._reference_depths:
             return True
         ref_depth = self._reference_depths[zone_idx]
-        zone = self._scene["red_zones"][zone_idx]
+        if zone_idx >= len(red_zones):
+            return True
+        zone = red_zones[zone_idx]
         margin = zone.get("depth_margin") or self.DEPTH_MARGIN_DEFAULT
 
         x1 = max(0, int(detection_bbox[0]))
@@ -221,17 +356,18 @@ class DetectionPipeline:
     def _run(self):
         set_thread_name("pipeline")
         logger.debug(f"Entered _run method in DetectionPipeline")
-        logger.debug(f"{self._scene['scene_id']}")
-        logger.debug(f"{self._scene['scene_name']}")
-        logger.debug(f"{self._scene['camera_ip_address']}")
-        logger.debug(f"{self._scene['camera_port']}")
-        logger.debug(f"{self._scene['red_zones']}")
+        with self._config_lock:
+            initial = self._current_config
+        logger.debug(f"{initial.scene.get('scene_id')}")
+        logger.debug(f"{initial.scene.get('scene_name')}")
+        logger.debug(f"{initial.scene.get('camera_ip_address')}")
+        logger.debug(f"{initial.scene.get('camera_port')}")
+        logger.debug(f"{initial.red_zones}")
         TARGET_FPS = 30
         target_dt = 1.0 / TARGET_FPS
         next_tick = time.monotonic()
 
         fps_times = []
-        red_zones = self._scene["red_zones"]
 
         while True:
             frame = self._capture.get()
@@ -241,14 +377,24 @@ class DetectionPipeline:
 
             annotated = frame.copy()
 
-            
-            result = self._occlusion_detector.process(frame)
+            # Snapshot the live config for this frame. The lock acquire is
+            # very short (one attribute read), so contention is negligible.
+            with self._config_lock:
+                cfg = self._current_config
+                occlusion = self._occlusion_detector
+                hailo = self._hailo_runner
+
+            red_zones = cfg.red_zones
+            scene_prompt = cfg.scene_prompt
+            scene_prompt_interval = cfg.scene_prompt_interval
+
+            result = occlusion.process(frame)
 
             if result is not None:
                 self._latest_occlusion_result = result
                 self._draw_occlusion(annotated, result)
 
-            yolo_detection = self._hailo_runner.get_latest()
+            yolo_detection = hailo.get_latest()
 
             if yolo_detection is not None:
                 self._draw_yolo_detection(annotated, yolo_detection)
@@ -264,20 +410,21 @@ class DetectionPipeline:
 
                     if self._pending_vlm_is_global:
                         self._pending_vlm_is_global = False
-                        if answer == "Yes":
-                            self._detection_events.emit(DetectionEvent(
-                                annotated_image=annotated.copy(),
-                                trigger="global_prompt",
-                                vlm_prompt=self._last_vlm_prompt or "",
-                                vlm_answer=answer,
-                                timestamp=now_vlm,
-                                zone=None,
-                            ))
+                        self._detection_events.emit(DetectionEvent(
+                            annotated_image=annotated.copy(),
+                            trigger="global_description",
+                            raw_frame=self._last_vlm_frame.copy() if self._last_vlm_frame is not None else None,
+                            vlm_prompt=self._last_vlm_prompt or "",
+                            vlm_answer=answer,
+                            timestamp=now_vlm,
+                            zone=None,
+                        ))
                     elif "yes" in answer.lower():
                         det_class = self._last_vlm_answer_zone.get("forbidden_classes", [])[0] if isinstance(self._last_vlm_answer_zone, dict) and self._last_vlm_answer_zone.get("forbidden_classes") else None
                         self._detection_events.emit(DetectionEvent(
                             annotated_image=annotated.copy(),
                             trigger="vlm_yes",
+                            raw_frame=self._last_vlm_frame.copy() if self._last_vlm_frame is not None else None,
                             detected_class=det_class,
                             vlm_prompt=self._last_vlm_prompt or "",
                             vlm_answer=answer,
@@ -286,11 +433,11 @@ class DetectionPipeline:
                         ))
 
                 if yolo_detection.yolo_result is not None:
-                    depth_on = self.get_depth_show() or self._any_zone_wants_depth()
-                    self._hailo_runner.set_depth_enabled(depth_on)
+                    depth_on = self.get_depth_show() or self._any_zone_wants_depth(red_zones)
+                    hailo.set_depth_enabled(depth_on)
 
                     if not self._reference_depths_ok:
-                        ready, ref_depths = self._hailo_runner.get_reference_depths(timeout=0.0)
+                        ready, ref_depths = hailo.get_reference_depths(timeout=0.0)
                         if ready:
                             self._reference_depths = ref_depths
                             self._reference_depths_ok = True
@@ -331,7 +478,7 @@ class DetectionPipeline:
                                                 if det.label == detected_class:
                                                     det_box = (det.x1, det.y1, det.x2, det.y2)
                                                     break
-                                            if det_box and not self._check_depth_match(zi, yolo_detection.depth_map, det_box):
+                                            if det_box and not self._check_depth_match(zi, red_zones, yolo_detection.depth_map, det_box):
                                                 continue
                                             trigger = "depth_match"
                                         else:
@@ -340,6 +487,7 @@ class DetectionPipeline:
                                         self._detection_events.emit(DetectionEvent(
                                             annotated_image=annotated.copy(),
                                             trigger=trigger,
+                                            raw_frame=frame.copy(),
                                             detected_class=detected_class,
                                             timestamp=datetime.now(),
                                             zone=zone,
@@ -357,16 +505,17 @@ class DetectionPipeline:
                                             if det.label == detected_class:
                                                 det_box = (det.x1, det.y1, det.x2, det.y2)
                                                 break
-                                        if det_box and not self._check_depth_match(zi, yolo_detection.depth_map, det_box):
+                                        if det_box and not self._check_depth_match(zi, red_zones, yolo_detection.depth_map, det_box):
                                             continue
 
                                     prompt_template = zone.get("vlm_prompt") or "Is the {class} attacking a plant?"
                                     prompt = prompt_template.replace("{class}", detected_class)
                                     logger.info(f"VLM trigger — zone {zi} overlapped for {elapsed:.1f}s, class={detected_class}")
-                                    self._hailo_runner.request_vlm(frame, zone=zone, detected_class=detected_class)
+                                    hailo.request_vlm(frame, zone=zone, detected_class=detected_class)
                                     self._last_event_by_zone[zi] = now_vlm
                                     self._last_vlm_answer_zone = zone
                                     self._last_vlm_prompt = prompt
+                                    self._last_vlm_frame = frame.copy()
                                     self._vlm_fired_for_zone.add(zi)
                                     self._pending_vlm_is_global = False
 
@@ -381,22 +530,23 @@ class DetectionPipeline:
                         with self._depth_viz_lock:
                             self._depth_viz = depth_color
 
-            if (self._scene_prompt
-                    and self._scene_prompt_interval
-                    and self._scene_prompt_interval > 0):
+            if (scene_prompt
+                    and scene_prompt_interval
+                    and scene_prompt_interval > 0):
                 now_mono = time.monotonic()
-                if (now_mono - self._last_global_vlm_time) >= self._scene_prompt_interval:
-                    logger.info(f"Global VLM trigger — interval={self._scene_prompt_interval}s")
-                    self._hailo_runner.request_vlm(
+                if (now_mono - self._last_global_vlm_time) >= scene_prompt_interval:
+                    logger.info(f"Global VLM trigger — interval={scene_prompt_interval}s")
+                    hailo.request_vlm(
                         frame,
                         zone=None,
                         detected_class=None,
                         is_global=True,
-                        global_prompt=self._scene_prompt,
+                        global_prompt=scene_prompt,
                     )
                     self._last_global_vlm_time = now_mono
                     self._last_vlm_answer_zone = None
-                    self._last_vlm_prompt = self._scene_prompt
+                    self._last_vlm_prompt = scene_prompt
+                    self._last_vlm_frame = frame.copy()
                     self._pending_vlm_is_global = True
 
 
@@ -424,7 +574,7 @@ class DetectionPipeline:
             else:
                 next_tick = time.monotonic()
 
-        
+
     def _draw_vlm_answer(self, annotated, answer, zone, question=None, color=(255, 255, 255)):
         x = zone.get("x", 10) if zone else 10
         y = zone.get("y", 30) if zone else 30

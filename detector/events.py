@@ -14,6 +14,7 @@ class DetectionEvent:
     annotated_image: np.ndarray
     trigger: str
     timestamp: datetime
+    raw_frame: Optional[np.ndarray] = None
     zone: Optional[dict] = None
     detected_class: Optional[str] = None
     vlm_prompt: Optional[str] = None
