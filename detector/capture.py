@@ -26,6 +26,13 @@ class FrameCapture:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
     
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        if self._cap:
+            self._cap.release()
+
     def _run(self):
         set_thread_name("capture")
         while not self._stop.is_set():

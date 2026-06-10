@@ -19,6 +19,10 @@ class DetectionEvent:
     detected_class: Optional[str] = None
     vlm_prompt: Optional[str] = None
     vlm_answer: Optional[str] = None
+    # True for events produced by the global scene-prompt timer (zone=None,
+    # trigger="global_description"). Action handlers use this to look up the
+    # scene-level scene_prompt_action_ids instead of the per-zone action_ids.
+    is_global_prompt: bool = False
 
 
 # Kept for backward compatibility with any external subscribers.
@@ -55,3 +59,61 @@ class DetectionEventEmitter:
 
 # Kept for backward compatibility with any external subscribers.
 VlmEventEmitter = DetectionEventEmitter
+
+
+# ── Dispatcher interface ──────────────────────────────────────────────────────
+# The pipeline calls this AFTER emitting on the in-process bus. It's a
+# separate channel so the dispatch registry (which talks to SMB / Telegram /
+# the public internet) doesn't have to subscribe to every event just to filter
+# by action_id — the pipeline has already resolved the zone's action_ids and
+# passes them along.
+
+DispatcherFn = Callable[[DetectionEvent, list[str]], None]
+"""Called with the event and the list of action IDs that should fire for it.
+
+For zone events, this is `event.zone["action_ids"]`. For global-prompt events,
+this is the scene's `scene_prompt_action_ids`. The dispatcher is responsible
+for looking up the action configs (by ID), filtering to types it knows how
+to handle, and fanning the event out to the right handler instances.
+"""
+
+
+class _DispatcherHolder:
+    """Mutable singleton holder so pipeline.py doesn't need to know about
+    the registry module. Set via DetectionEvent.set_dispatcher(...)."""
+
+    def __init__(self):
+        self.fn: Optional[DispatcherFn] = None
+
+
+_dispatcher = _DispatcherHolder()
+
+
+def set_dispatcher(fn: Optional[DispatcherFn]) -> None:
+    """Install (or clear with None) the pipeline-level dispatcher.
+
+    Called once at worker startup. The dispatcher is invoked after the
+    in-process event bus so existing SampleSaverHandler subscribers keep
+    working unchanged.
+    """
+    _dispatcher.fn = fn
+
+
+def get_dispatcher() -> Optional[DispatcherFn]:
+    return _dispatcher.fn
+
+
+def dispatch_event(event: DetectionEvent, action_ids: list[str]) -> None:
+    """Invoke the registered dispatcher (if any) with the given event and
+    action_ids. No-op when no dispatcher is registered. Exceptions raised by
+    the dispatcher are logged and swallowed — never propagate into the
+    pipeline hot loop.
+    """
+    fn = _dispatcher.fn
+    if fn is None:
+        return
+    try:
+        fn(event, action_ids)
+    except Exception:
+        logger.exception("DetectionEvent dispatcher raised; ignoring")
+

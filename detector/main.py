@@ -5,13 +5,24 @@ import threading
 
 from dotenv import load_dotenv
 
+# Load .env before hailo_platform is imported so HAILORT_LOGGER_PATH takes effect.
+load_dotenv()
+import os as _os
+_os.makedirs(_os.path.expanduser("~/.local/share/catyolo/logs"), exist_ok=True)
+_os.environ.setdefault(
+    "HAILORT_LOGGER_PATH",
+    _os.path.expanduser("~/.local/share/catyolo/logs/hailort.log"),
+)
+del _os
+
+from detector.actions_watcher import ActionsWatcher
 from detector.capture import FrameCapture
 from detector.config import SceneConfig
 from detector.config_watcher import ConfigWatcher
+from detector.events import set_dispatcher
+from detector.handlers.registry import ActionHandlerRegistry
 from detector.handlers.sample_saver import SampleSaverHandler
 from detector.pipeline import DetectionPipeline
-
-load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,6 +80,22 @@ def main():
         threading.Thread(target=run_stream, args=(pipeline, port), daemon=True).start()
         logger.info("debug stream started on port %s", port)
 
+    # ── Action dispatch ─────────────────────────────────────────────────
+    # The registry owns one handler per known action_id. The ActionsWatcher
+    # polls /action/ every 2s, diffs the snapshot, and pushes updates to
+    # the registry. The registry is registered as the pipeline-level
+    # dispatcher; the pipeline calls it with (event, action_ids) for every
+    # DetectionEvent.
+    action_registry = ActionHandlerRegistry()
+    set_dispatcher(action_registry.dispatch_event)
+
+    actions_watcher = ActionsWatcher(
+        api_base=api_base,
+        on_change=action_registry.set_actions,
+    )
+    actions_watcher.start()
+    logger.info("actions watcher started")
+
     config_watcher = ConfigWatcher(
         api_base=api_base,
         on_change=pipeline.reload_config,
@@ -76,12 +103,20 @@ def main():
     config_watcher.start()
     logger.info("config watcher started")
 
+    shutdown = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: shutdown.set())
+    signal.signal(signal.SIGINT, lambda *_: shutdown.set())
     try:
-        signal.pause()
+        shutdown.wait()
     finally:
         config_watcher.stop()
-        logger.info("config watcher stopped")
+        actions_watcher.stop()
+        action_registry.stop()
+        pipeline.stop()
+        capture.stop()
+        logger.info("shutdown complete")
 
 
 if __name__ == "__main__":
     main()
+
