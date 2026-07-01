@@ -112,6 +112,7 @@ class WebhookDispatcherHandler(BaseActionHandler):
         data = {
             "metadata": json.dumps(payload["metadata"], ensure_ascii=False),
             "trigger": event.trigger,
+            "scene_id": event.scene_id or "",
             "detected_class": event.detected_class or "",
             "timestamp": event.timestamp.isoformat(),
         }

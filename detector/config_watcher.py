@@ -1,3 +1,23 @@
+"""ConfigWatcher — polls the backend for per-scene config changes (WS2).
+
+Replaces the legacy single-global-version poll with a per-scene version diff:
+  - GET {api_base}/scene/version -> {"version": <max>,
+                                     "scenes": [{"scene_id", "version"}]}
+  - compare per-scene versions against the last known set
+  - for changed/new scenes, fetch full scene dicts via /scene/internal/
+    (carries camera_password, needed to build the RTSP URL)
+  - call on_change(changed: list[SceneConfig], removed: list[str])
+
+First tick after start() always fires all current scenes as "changed" (the
+same force-emit pattern as ActionsWatcher and the legacy ConfigWatcher), so
+the watcher also serves as the initial load path — main() doesn't need to
+start scenes itself.
+
+Reuses the diff-and-reconcile shape proven in ActionsWatcher: poll full list,
+compute per-item delta, only invoke the callback when something moved, and
+swallow per-tick exceptions so the poll loop survives a bad tick.
+"""
+
 import logging
 import os
 import threading
@@ -11,24 +31,12 @@ logger = logging.getLogger(__name__)
 
 
 class ConfigWatcher:
-    """Background thread that polls the backend for scene-config changes and
-    calls `on_change(new_config)` whenever a new version is observed.
-
-    Mechanism:
-      - GET {api_base}/scene/version  -> small integer
-      - if it moves, GET {api_base}/scene/  -> first scene -> build SceneConfig
-      - call on_change(config)
-
-    First tick after `start()` always fires (so the watcher can also be used as
-    a "first load" path). The pipeline uses that to converge with the same code
-    path that handles live reloads.
-    """
-
     def __init__(
         self,
         api_base: str,
-        on_change: Callable[[SceneConfig], None],
+        on_change: Callable[[list[SceneConfig], list[str]], None],
         poll_interval: Optional[float] = None,
+        api_key: Optional[str] = None,
     ):
         self._api_base = api_base.rstrip("/")
         self._on_change = on_change
@@ -39,11 +47,11 @@ class ConfigWatcher:
         )
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._last_version: Optional[int] = None
-        # When True, the next poll fires on_change regardless of version. Set
-        # to True on start() so we always emit at least once.
+        self._last_versions: dict[str, int] = {}
         self._force_emit = True
         self._session = requests.Session()
+        if api_key:
+            self._session.headers["X-API-Key"] = api_key
 
     def start(self):
         if self._thread is not None:
@@ -75,63 +83,84 @@ class ConfigWatcher:
                 self._tick()
             except Exception:
                 logger.exception("ConfigWatcher tick failed")
-            # Interruptible sleep
             self._stop_event.wait(self._poll_interval)
 
     def _tick(self):
-        version = self._fetch_version()
-        if version is None:
+        versions = self._fetch_versions()
+        if versions is None:
             return
 
-        if not self._force_emit and version == self._last_version:
+        current_ids = set(versions.keys())
+        last_ids = set(self._last_versions.keys())
+
+        # Quick path: nothing changed since last tick (and not the first tick).
+        if not self._force_emit and versions == self._last_versions:
             return
 
-        scene = self._fetch_first_scene()
-        if scene is None:
-            logger.debug("No scenes available; skipping reload")
+        changed_ids = [
+            sid for sid, v in versions.items()
+            if self._force_emit or self._last_versions.get(sid) != v
+        ]
+        removed_ids = list(last_ids - current_ids)
+
+        if not changed_ids and not removed_ids:
+            # versions dict identity already checked above, so this only happens
+            # on the first tick with an empty scene set.
+            self._last_versions = versions
+            self._force_emit = False
             return
 
-        try:
-            config = SceneConfig.from_scene_dict(scene)
-        except Exception:
-            logger.exception("Failed to build SceneConfig from scene dict")
-            return
+        scenes_by_id = self._fetch_scenes(changed_ids) if changed_ids else {}
+        changed: list[SceneConfig] = []
+        for sid in changed_ids:
+            scene = scenes_by_id.get(sid)
+            if scene is None:
+                logger.debug("Scene %s vanished between version and detail fetch; skipping", sid)
+                continue
+            try:
+                changed.append(SceneConfig.from_scene_dict(scene))
+            except Exception:
+                logger.exception("Failed to build SceneConfig for scene %s", sid)
 
-        previous = self._last_version
-        self._last_version = version
+        previous = self._last_versions
+        self._last_versions = versions
         self._force_emit = False
 
         logger.info(
-            "Scene config change detected — version %s -> %s, scene_id=%s, zones=%d",
-            previous,
-            version,
-            config.scene.get("scene_id"),
-            len(config.red_zones),
+            "Scene config change — changed=%d removed=%d (previous=%s)",
+            len(changed), len(removed_ids),
+            {k: v for k, v in previous.items()} or "—",
         )
         try:
-            self._on_change(config)
+            self._on_change(changed, removed_ids)
         except Exception:
             logger.exception("on_change callback raised; will retry next tick")
 
-    def _fetch_version(self) -> Optional[int]:
+    def _fetch_versions(self) -> Optional[dict[str, int]]:
         try:
             r = self._session.get(f"{self._api_base}/scene/version", timeout=2.0)
             r.raise_for_status()
             data = r.json()
-            v = data.get("version")
-            return int(v) if v is not None else None
+            scenes = data.get("scenes") or []
+            return {s["scene_id"]: int(s.get("version") or 0) for s in scenes}
         except Exception as e:
             logger.debug("Failed to fetch /scene/version: %s", e)
             return None
 
-    def _fetch_first_scene(self) -> Optional[dict]:
+    def _fetch_scenes(self, scene_ids: list[str]) -> dict[str, dict]:
+        # The backend has no per-scene internal endpoint; /scene/internal/
+        # returns all scenes with credentials. Fetch once and filter locally —
+        # the payload is small (≤ MAX_SCENES scenes).
         try:
-            r = self._session.get(f"{self._api_base}/scene", timeout=5.0)
+            r = self._session.get(f"{self._api_base}/scene/internal/", timeout=5.0)
             r.raise_for_status()
             scenes = r.json()
         except Exception:
-            logger.exception("Failed to fetch /scene")
-            return None
-        if not scenes:
-            return None
-        return scenes[0]
+            logger.exception("Failed to fetch /scene/internal/")
+            return {}
+        wanted = set(scene_ids)
+        return {
+            s.get("scene_id"): s
+            for s in scenes
+            if s.get("scene_id") in wanted
+        }

@@ -2,7 +2,7 @@ import logging
 import os
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import yaml
@@ -15,21 +15,63 @@ logger = logging.getLogger(__name__)
 _SUPPORTED_ARCHS = ("hailo10h", "hailo8")
 
 
+def create_shared_device() -> Any:
+    """Create ONE VDevice shared across all per-scene backends.
+
+    Uses HailoRT's ROUND_ROBIN scheduler with group_id='SHARED' so frames
+    submitted by every per-scene pipeline's backend are multiplexed across
+    the single physical device. This is the multi-camera enabler: instead
+    of each backend opening (and on reload releasing) its own VDevice, all
+    backends attach to this shared device and only own their per-backend
+    model handles (released on reload/teardown, leaving the device open).
+
+    Lazy-imports hailo_platform so the module imports cleanly on dev
+    machines / CI without a Hailo chip.
+    """
+    from hailo_platform import HailoSchedulingAlgorithm, VDevice
+
+    params = VDevice.create_params()
+    params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
+    params.group_id = "SHARED"
+    logger.info("Created shared VDevice (ROUND_ROBIN / SHARED)")
+    return VDevice(params)
+
+
+def release_shared_device(device: Any) -> None:
+    """Release the shared VDevice exactly once at worker shutdown."""
+    if device is None:
+        return
+    try:
+        device.release()
+        logger.info("Shared VDevice released")
+    except Exception:
+        logger.exception("Error releasing shared VDevice")
+
+
 def create_backend(
     capture: FrameCapture,
     yolo_classes: list[str],
     reference_image: Optional[np.ndarray] = None,
     red_zones: Optional[list] = None,
+    shared_device: Any = None,
 ) -> InferenceBackend:
     """Probe the installed Hailo chip (or read HAILO_ARCH env) and return the
-    appropriate backend configured with HEF paths from the per-arch manifest."""
+    appropriate backend configured with HEF paths from the per-arch manifest.
+
+    When `shared_device` is provided (a VDevice created by create_shared_device),
+    the backend attaches to it instead of opening its own — this is the
+    multi-camera path. When None (legacy/tests), the backend owns its VDevice.
+    """
     arch = os.getenv("HAILO_ARCH", "").strip().lower() or _probe_arch()
     if arch not in _SUPPORTED_ARCHS:
         logger.warning("Unknown HAILO_ARCH=%r; falling back to hailo10h", arch)
         arch = "hailo10h"
 
     hef_config = _load_manifest(arch)
-    logger.info("Creating %s backend (HAILO_ARCH=%s)", arch, arch)
+    logger.info(
+        "Creating %s backend (HAILO_ARCH=%s, shared_device=%s)",
+        arch, arch, shared_device is not None,
+    )
 
     if arch == "hailo10h":
         from detector.inference.hailo10_backend import Hailo10Backend
@@ -39,6 +81,7 @@ def create_backend(
             hef_config=hef_config,
             reference_image=reference_image,
             red_zones=red_zones,
+            shared_device=shared_device,
         )
     else:
         from detector.inference.hailo8_backend import Hailo8Backend
@@ -48,6 +91,7 @@ def create_backend(
             hef_config=hef_config,
             reference_image=reference_image,
             red_zones=red_zones,
+            shared_device=shared_device,
         )
 
 

@@ -18,7 +18,7 @@ from detector.handlers.base import BaseActionHandler
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_TEMPLATE = "🚨 {trigger} detected: {class} at {ts}"
+DEFAULT_TEMPLATE = "🚨 {scene}: {trigger} detected: {class} at {ts}"
 
 
 def _render_template(template: str, event: DetectionEvent) -> str:
@@ -26,6 +26,7 @@ def _render_template(template: str, event: DetectionEvent) -> str:
         trigger=event.trigger,
         class_=event.detected_class or "object",
         cls=event.detected_class or "object",
+        scene=event.scene_id or "unknown-scene",
         ts=event.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
     )
 

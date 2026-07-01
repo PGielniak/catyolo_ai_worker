@@ -75,6 +75,14 @@ class InferenceBackend(ABC):
     @abstractmethod
     def get_reference_depths(self, timeout: float = 0.0) -> tuple[bool, dict[int, float]]: ...
 
+    def get_depth_tuning(self) -> dict:
+        """Live depth-pipeline tuning values. Default: empty (unsupported)."""
+        return {}
+
+    def set_depth_tuning(self, params: dict) -> dict:
+        """Update live depth-pipeline tuning values. Default: no-op."""
+        return {}
+
     def request_vlm(
         self,
         frame: np.ndarray,

@@ -47,7 +47,11 @@ class SampleSaverHandler:
 
     def _save(self, event):
         ts = event.timestamp.strftime("%Y%m%d_%H%M%S_%f")
-        folder = self._samples_dir / f"{ts}_{event.trigger}"
+        # Nest under scene_id so concurrent scenes never collide on
+        # timestamp+trigger folder names, and samples are browsable per camera.
+        scene_dir = self._samples_dir / (event.scene_id or "unknown_scene")
+        scene_dir.mkdir(parents=True, exist_ok=True)
+        folder = scene_dir / f"{ts}_{event.trigger}"
         folder.mkdir(parents=True, exist_ok=True)
 
         if event.raw_frame is not None:
@@ -59,6 +63,7 @@ class SampleSaverHandler:
         meta = {
             "trigger": event.trigger,
             "timestamp": event.timestamp.isoformat(),
+            "scene_id": event.scene_id,
             "detected_class": event.detected_class,
             "vlm_prompt": event.vlm_prompt,
             "vlm_answer": event.vlm_answer,
@@ -68,4 +73,4 @@ class SampleSaverHandler:
             } if event.zone else None,
         }
         (folder / "metadata.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
-        logger.debug("Saved sample %s", folder.name)
+        logger.debug("Saved sample %s/%s", scene_dir.name, folder.name)

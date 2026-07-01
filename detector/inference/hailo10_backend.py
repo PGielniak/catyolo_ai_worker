@@ -5,9 +5,10 @@ import subprocess
 import threading
 import time
 import re
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import cv2
 import numpy as np
@@ -50,6 +51,7 @@ class Hailo10Backend(InferenceBackend):
         hef_config: dict,
         reference_image: Optional[np.ndarray] = None,
         red_zones: Optional[list] = None,
+        shared_device: Any = None,
     ):
         self._capture = capture
         self.yolo_classes = yolo_classes
@@ -69,20 +71,40 @@ class Hailo10Backend(InferenceBackend):
         self._setup_complete = threading.Event()
 
         self._device = None
+        # When a shared_device is injected (multi-camera path), the backend
+        # attaches to it and never releases it — main() owns the single
+        # VDevice across all per-scene backends. When None (legacy/test
+        # path), the backend owns its own VDevice lifecycle.
+        self._shared_device = shared_device
+        self._owns_device = shared_device is None
+
         self._yolo_infer_model = None
         self._yolo_configured_infer_model = None
         self._desired_h: Optional[int] = None
         self._desired_w: Optional[int] = None
         self._c: Optional[int] = None
 
-        self._fastdepth_infer_model = None
-        self._fastdepth_configured_infer_model = None
-        self._fastdepth_desired_h: Optional[int] = None
-        self._fastdepth_desired_w: Optional[int] = None
-        self._fastdepth_c: Optional[int] = None
+        self._depth_infer_model = None
+        self._depth_configured_infer_model = None
+        self._depth_desired_h: Optional[int] = None
+        self._depth_desired_w: Optional[int] = None
+        self._depth_c: Optional[int] = None
 
         self._depth_enabled = False
         self._depth_lock = threading.Lock()
+
+        self._depth_smooth_window: int = max(1, int(os.getenv("DEPTH_SMOOTH_WINDOW", "5")))
+        self._depth_buffer: deque = deque(maxlen=self._depth_smooth_window)
+
+        self._depth_diff_threshold: float = float(os.getenv("DEPTH_DIFF_THRESHOLD", "4.0"))
+        self._depth_diff_downsample: int = int(os.getenv("DEPTH_DIFF_DOWNSAMPLE", "8"))
+        self._prev_gray: Optional[np.ndarray] = None
+        self._cached_depth_map: Optional[np.ndarray] = None
+
+        self._depth_guided_radius: int = int(os.getenv("DEPTH_GUIDED_RADIUS", "8"))
+        self._depth_guided_eps: float = float(os.getenv("DEPTH_GUIDED_EPS", "0.01"))
+
+        self._depth_tuning_lock = threading.Lock()
 
         self._vlm = None
         self._vlm_request_lock = threading.Lock()
@@ -93,7 +115,12 @@ class Hailo10Backend(InferenceBackend):
         self._reference_depths_ready = threading.Event()
 
         # Capabilities are updated dynamically in _setup() if VLM/depth fail to load.
-        self._capabilities = BackendCapabilities(supports_vlm=True, supports_depth=True)
+        # max_concurrent_streams advertises how many per-scene feeds the HailoRT
+        # ROUND_ROBIN scheduler can multiplex; 3 is the design target (up to 3
+        # cameras). On-device benchmark pending — see architecture/WS2.
+        self._capabilities = BackendCapabilities(
+            supports_vlm=True, supports_depth=True, max_concurrent_streams=3,
+        )
 
     @property
     def capabilities(self) -> BackendCapabilities:
@@ -122,6 +149,54 @@ class Hailo10Backend(InferenceBackend):
     def set_depth_enabled(self, enabled: bool) -> None:
         with self._depth_lock:
             self._depth_enabled = enabled
+
+    # Tuning keys accepted by set_depth_tuning / returned by get_depth_tuning.
+    _DEPTH_TUNING_KEYS = (
+        "depth_diff_threshold",
+        "depth_diff_downsample",
+        "depth_smooth_window",
+        "depth_guided_radius",
+        "depth_guided_eps",
+    )
+
+    def get_depth_tuning(self) -> dict:
+        with self._depth_tuning_lock:
+            return {
+                "depth_diff_threshold": self._depth_diff_threshold,
+                "depth_diff_downsample": self._depth_diff_downsample,
+                "depth_smooth_window": self._depth_smooth_window,
+                "depth_guided_radius": self._depth_guided_radius,
+                "depth_guided_eps": self._depth_guided_eps,
+            }
+
+    def set_depth_tuning(self, params: dict) -> dict:
+        applied: dict = {}
+        with self._depth_tuning_lock:
+            if "depth_diff_threshold" in params:
+                v = float(params["depth_diff_threshold"])
+                if v >= 0:
+                    self._depth_diff_threshold = v
+                    applied["depth_diff_threshold"] = v
+            if "depth_diff_downsample" in params:
+                v = max(1, int(params["depth_diff_downsample"]))
+                self._depth_diff_downsample = v
+                applied["depth_diff_downsample"] = v
+            if "depth_smooth_window" in params:
+                v = max(1, int(params["depth_smooth_window"]))
+                if v != self._depth_smooth_window:
+                    self._depth_smooth_window = v
+                    self._depth_buffer = deque(maxlen=v)
+                applied["depth_smooth_window"] = v
+            if "depth_guided_radius" in params:
+                v = max(1, int(params["depth_guided_radius"]))
+                self._depth_guided_radius = v
+                applied["depth_guided_radius"] = v
+            if "depth_guided_eps" in params:
+                v = float(params["depth_guided_eps"])
+                if v > 0:
+                    self._depth_guided_eps = v
+                    applied["depth_guided_eps"] = v
+        return applied
 
     def get_reference_depths(self, timeout: float = 0.0) -> tuple[bool, dict[int, float]]:
         ready = self._reference_depths_ready.wait(timeout=timeout)
@@ -154,18 +229,24 @@ class Hailo10Backend(InferenceBackend):
     # ------------------------------------------------------------------ #
 
     def _setup(self) -> None:
-        from hailo_platform import Device, HailoSchedulingAlgorithm, VDevice
+        if self._shared_device is not None:
+            # Multi-camera path: attach to the VDevice owned by main().
+            self._device = self._shared_device
+            logger.info("Attaching to shared VDevice (owned by main)")
+        else:
+            # Legacy/test path: own the VDevice lifecycle.
+            from hailo_platform import Device, HailoSchedulingAlgorithm, VDevice
 
-        device_ids = self._get_hailo_device_ids()
-        if not device_ids:
-            raise RuntimeError("No Hailo devices found")
-        for dev_id in device_ids:
-            logger.info(self._get_hailo_device_info(dev_id))
+            device_ids = self._get_hailo_device_ids()
+            if not device_ids:
+                raise RuntimeError("No Hailo devices found")
+            for dev_id in device_ids:
+                logger.info(self._get_hailo_device_info(dev_id))
 
-        params = VDevice.create_params()
-        params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
-        params.group_id = "SHARED"
-        self._device = VDevice(params)
+            params = VDevice.create_params()
+            params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
+            params.group_id = "SHARED"
+            self._device = VDevice(params)
 
         self._setup_yolo()
         self._setup_depth()
@@ -191,13 +272,13 @@ class Hailo10Backend(InferenceBackend):
             )
             return
         try:
-            self._fastdepth_infer_model = self._device.create_infer_model(str(self._depth_path))
-            input_name = self._fastdepth_infer_model.input_names[0]
-            self._fastdepth_desired_h, self._fastdepth_desired_w, self._fastdepth_c = (
-                self._fastdepth_infer_model.input(input_name).shape
+            self._depth_infer_model = self._device.create_infer_model(str(self._depth_path))
+            input_name = self._depth_infer_model.input_names[0]
+            self._depth_desired_h, self._depth_desired_w, self._depth_c = (
+                self._depth_infer_model.input(input_name).shape
             )
-            self._fastdepth_configured_infer_model = self._fastdepth_infer_model.configure()
-            logger.info("Depth configured (%dx%d)", self._fastdepth_desired_h, self._fastdepth_desired_w)
+            self._depth_configured_infer_model = self._depth_infer_model.configure()
+            logger.info("Depth configured (%dx%d)", self._depth_desired_h, self._depth_desired_w)
         except Exception as e:
             logger.error("Error setting up depth model: %s", e)
             self._capabilities = BackendCapabilities(
@@ -231,8 +312,8 @@ class Hailo10Backend(InferenceBackend):
             "_vlm",
             "_yolo_configured_infer_model",
             "_yolo_infer_model",
-            "_fastdepth_configured_infer_model",
-            "_fastdepth_infer_model",
+            "_depth_configured_infer_model",
+            "_depth_infer_model",
         ):
             try:
                 obj = getattr(self, attr, None)
@@ -249,11 +330,14 @@ class Hailo10Backend(InferenceBackend):
                 logger.exception("Error releasing %s", attr)
 
         try:
-            if self._device is not None:
+            if self._device is not None and self._owns_device:
                 self._device.release()
-                self._device = None
         except Exception:
             logger.exception("Error releasing VDevice")
+        finally:
+            # Always drop our reference. For shared devices this does NOT
+            # release the underlying VDevice — main() owns and releases it.
+            self._device = None
 
     # ------------------------------------------------------------------ #
     # Background thread
@@ -359,20 +443,85 @@ class Hailo10Backend(InferenceBackend):
 
     def _run_depth(self, image: np.ndarray) -> np.ndarray:
         original_h, original_w = image.shape[:2]
-        input_image, _, _, _, _ = letterbox(image, self._fastdepth_desired_h, self._fastdepth_desired_w)
 
-        if self._fastdepth_c == 4 and input_image.shape[2] == 3:
+        # Snapshot tuning under the lock so a concurrent set_depth_tuning()
+        # (from the worker debug HTTP endpoint) can't tear a frame.
+        with self._depth_tuning_lock:
+            diff_threshold = self._depth_diff_threshold
+            diff_downsample = self._depth_diff_downsample
+            guided_radius = self._depth_guided_radius
+            guided_eps = self._depth_guided_eps
+            buffer = self._depth_buffer
+
+        # Frame-difference gate: if the scene barely changed since the last
+        # frame, reuse the cached depth map instead of re-running inference.
+        # This is the single biggest flicker killer for a fixed RTSP camera.
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        step = max(1, diff_downsample)
+        gray_small = gray[::step, ::step]
+        reuse = False
+        if (
+            self._prev_gray is not None
+            and self._cached_depth_map is not None
+            and self._prev_gray.shape == gray_small.shape
+        ):
+            diff = cv2.absdiff(gray_small, self._prev_gray)
+            mean_diff = float(diff.mean())
+            reuse = mean_diff < diff_threshold
+            logger.debug("Depth frame-diff mean=%.3f reuse=%s", mean_diff, reuse)
+        self._prev_gray = gray_small
+        if reuse:
+            return self._cached_depth_map
+
+        depth_map = self._run_depth_raw(image)
+        if depth_map is None:
+            return self._cached_depth_map if self._cached_depth_map is not None else None
+
+        # Guided filter: smooth flat depth regions while keeping edges that
+        # align with the RGB image (object boundaries). The guide is the
+        # grayscale frame at the same resolution as the depth map.
+        try:
+            guide = cv2.resize(
+                gray, (original_w, original_h), interpolation=cv2.INTER_AREA,
+            )
+            depth_map = cv2.ximgproc.guidedFilter(
+                guide, depth_map,
+                radius=guided_radius,
+                eps=guided_eps * 255.0 * 255.0,
+            )
+        except Exception:
+            logger.debug("guidedFilter failed, falling back to GaussianBlur", exc_info=True)
+            depth_map = cv2.GaussianBlur(depth_map, (5, 5), 0)
+
+        # Temporal median over the last N frames.
+        if buffer and buffer[0].shape == depth_map.shape:
+            buffer.append(depth_map)
+            if len(buffer) > 1:
+                depth_map = np.median(np.stack(buffer, axis=0), axis=0)
+        else:
+            buffer.clear()
+            buffer.append(depth_map)
+
+        self._cached_depth_map = depth_map
+        return depth_map
+
+    def _run_depth_raw(self, image: np.ndarray) -> Optional[np.ndarray]:
+        original_h, original_w = image.shape[:2]
+        input_image = cv2.resize(
+            image, (self._depth_desired_w, self._depth_desired_h), interpolation=cv2.INTER_AREA,
+        )
+        if self._depth_c == 4 and input_image.shape[2] == 3:
             h_in, w_in, _ = input_image.shape
             padded = np.zeros((h_in, w_in, 4), dtype=np.uint8)
             padded[:, :, :3] = input_image
             input_image = padded
 
         input_data = np.ascontiguousarray(input_image, dtype=np.uint8)
-        bindings = self._fastdepth_configured_infer_model.create_bindings()
-        bindings.input(self._fastdepth_infer_model.input_names[0]).set_buffer(input_data)
-        for out_name in self._fastdepth_infer_model.output_names:
-            out_shape = self._fastdepth_infer_model.output(out_name).shape
-            out_format = self._fastdepth_infer_model.output(out_name).format
+        bindings = self._depth_configured_infer_model.create_bindings()
+        bindings.input(self._depth_infer_model.input_names[0]).set_buffer(input_data)
+        for out_name in self._depth_infer_model.output_names:
+            out_shape = self._depth_infer_model.output(out_name).shape
+            out_format = self._depth_infer_model.output(out_name).format
             type_str = str(out_format.type)
             if "UINT16" in type_str:
                 np_dtype = np.uint16
@@ -381,9 +530,9 @@ class Hailo10Backend(InferenceBackend):
             else:
                 np_dtype = np.uint8
             bindings.output(out_name).set_buffer(np.empty(out_shape, dtype=np_dtype))
-        self._fastdepth_configured_infer_model.run([bindings], timeout=1000)
+        self._depth_configured_infer_model.run([bindings], timeout=1000)
         output = bindings.output(out_name).get_buffer()
-        depth_map = output.squeeze()
+        depth_map = output.squeeze().astype(np.float32)
         return cv2.resize(depth_map, (original_w, original_h), interpolation=cv2.INTER_LINEAR)
 
     def _run_vlm(self, frame: np.ndarray, question: str, is_global: bool = False) -> str:

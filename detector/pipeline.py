@@ -1,11 +1,12 @@
 import logging
+import os
 import time
 import threading
-import requests
 import cv2
 logger = logging.getLogger(__name__)
 import numpy as np
 from datetime import datetime
+from typing import Any
 from detector.detectors.occlusion_detectionV2 import OcclusionDetector
 from detector.inference.factory import create_backend
 from detector.inference.protocols import InferenceBackend
@@ -29,9 +30,13 @@ class DetectionPipeline:
     # Settle and setup timeouts are now backend-specific; read from the backend
     # instance via RELOAD_SETTLE_SECONDS / SETUP_TIMEOUT class attributes.
 
-    def __init__(self, capture, api_base: str, initial_config: SceneConfig):
+    def __init__(self, capture, api_base: str, initial_config: SceneConfig, shared_device: Any = None):
         self._capture = capture
         self._api_base = api_base
+        # Shared Hailo VDevice (multi-camera). When None, the backend owns its
+        # own device (legacy/test path). Injected so all per-scene pipelines
+        # multiplex over one physical device via the HailoRT ROUND_ROBIN scheduler.
+        self._shared_device = shared_device
         self._annotated = None
         self._annotated_lock = threading.Lock()
         self._depth_viz = None
@@ -68,6 +73,9 @@ class DetectionPipeline:
         self._last_global_vlm_time = 0.0
         self._pending_vlm_is_global = False
 
+        # Global object-detection trigger bookkeeping
+        self._last_global_detection_time = 0.0
+
         # Reference depths — read from the hailo runner as it finishes
         # computing them.
         self._latest_occlusion_result = None
@@ -100,6 +108,7 @@ class DetectionPipeline:
             yolo_classes=cfg.forbidden_classes,
             reference_image=cfg.reference_image,
             red_zones=cfg.red_zones,
+            shared_device=self._shared_device,
         )
 
     # ------------------------------------------------------------------ #
@@ -121,6 +130,16 @@ class DetectionPipeline:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=timeout)
+        # Stop the Hailo backend too so a per-scene shutdown (multi-camera)
+        # doesn't leave its hailo thread running. With a shared device the
+        # backend's _teardown releases only its model handles, NOT the shared
+        # VDevice — so stopping one scene never pulls the device out from under
+        # the other scenes.
+        try:
+            if self._hailo_runner is not None:
+                self._hailo_runner.stop(timeout=self.RELOAD_STOP_TIMEOUT)
+        except Exception:
+            logger.exception("Error stopping HailoRunner during pipeline shutdown")
 
     def reload_config(self, new_config: SceneConfig):
         """Atomically replace the running config, rebuilding the occlusion
@@ -198,6 +217,7 @@ class DetectionPipeline:
             self._last_vlm_prompt = None
             self._last_vlm_frame = None
             self._pending_vlm_is_global = False
+            self._last_global_detection_time = 0.0
 
             # ---- Atomic swap ----
             with self._config_lock:
@@ -283,6 +303,24 @@ class DetectionPipeline:
                         hits[idx] = det.label
         return hits
 
+    def _check_global_detection(self, yolo_result, cfg: SceneConfig, now_mono: float):
+        """Emit a global detection event if a configured class is seen anywhere in the frame
+        and the cooldown has elapsed. Returns the matching class or None."""
+        if not cfg.global_detection_enabled:
+            return None
+        trigger_classes = cfg.global_detection_classes or []
+        if not trigger_classes:
+            return None
+        if yolo_result is None or not yolo_result.detections:
+            return None
+        cooldown = cfg.global_detection_cooldown_seconds or 60
+        if now_mono - self._last_global_detection_time < cooldown:
+            return None
+        for det in yolo_result.detections:
+            if det.label in trigger_classes:
+                return det.label
+        return None
+
     def _any_zone_wants_depth(self, red_zones) -> bool:
         for rz in red_zones:
             if rz.get("depth_enabled"):
@@ -325,7 +363,13 @@ class DetectionPipeline:
         logger.debug(f"{initial.scene.get('camera_ip_address')}")
         logger.debug(f"{initial.scene.get('camera_port')}")
         logger.debug(f"{initial.red_zones}")
-        TARGET_FPS = 30
+        # Per-scene FPS cap. With multi-camera (WS2) the HailoRT ROUND_ROBIN
+        # scheduler time-slices the NPU across scenes; the single-slot capture
+        # buffer drops to newest for free when the NPU can't keep up. Lowering
+        # TARGET_FPS reduces wasted CPU occlusion work when the NPU is the
+        # bottleneck. Tunable via env so multi-camera deployments can dial it
+        # down (e.g. 3 feeds at ~10fps each) without a code change.
+        TARGET_FPS = int(os.getenv("TARGET_FPS", "30"))
         target_dt = 1.0 / TARGET_FPS
         next_tick = time.monotonic()
 
@@ -381,26 +425,36 @@ class DetectionPipeline:
                             timestamp=now_vlm,
                             zone=None,
                             is_global_prompt=True,
+                            scene_id=cfg.scene.get("scene_id"),
                         )
                         self._detection_events.emit(global_event)
                         with self._config_lock:
                             global_action_ids = self._current_config.scene_prompt_action_ids or []
                         dispatch_event(global_event, global_action_ids)
-                    elif "yes" in answer.lower():
-                        det_class = self._last_vlm_answer_zone.get("forbidden_classes", [])[0] if isinstance(self._last_vlm_answer_zone, dict) and self._last_vlm_answer_zone.get("forbidden_classes") else None
-                        vlm_yes_event = DetectionEvent(
-                            annotated_image=annotated.copy(),
-                            trigger="vlm_yes",
-                            raw_frame=self._last_vlm_frame.copy() if self._last_vlm_frame is not None else None,
-                            detected_class=det_class,
-                            vlm_prompt=self._last_vlm_prompt or "",
-                            vlm_answer=answer,
-                            timestamp=now_vlm,
-                            zone=self._last_vlm_answer_zone,
-                        )
-                        self._detection_events.emit(vlm_yes_event)
-                        zone_action_ids = (self._last_vlm_answer_zone or {}).get("action_ids") or []
-                        dispatch_event(vlm_yes_event, zone_action_ids)
+                    elif self._last_vlm_answer_zone is not None:
+                        zone = self._last_vlm_answer_zone
+                        vlm_decides_trigger = zone.get("vlm_decides_trigger")
+                        # Default (None/False): VLM is informational only — always fire.
+                        # True: legacy behaviour — fire only on a Yes answer.
+                        if vlm_decides_trigger is True and "yes" not in answer.lower():
+                            pass
+                        else:
+                            det_class = zone.get("forbidden_classes", [])[0] if zone.get("forbidden_classes") else None
+                            trigger_name = "vlm_yes" if vlm_decides_trigger is True else "vlm_processed"
+                            vlm_event = DetectionEvent(
+                                annotated_image=annotated.copy(),
+                                trigger=trigger_name,
+                                raw_frame=self._last_vlm_frame.copy() if self._last_vlm_frame is not None else None,
+                                detected_class=det_class,
+                                vlm_prompt=self._last_vlm_prompt or "",
+                                vlm_answer=answer,
+                                timestamp=now_vlm,
+                                zone=zone,
+                                scene_id=cfg.scene.get("scene_id"),
+                            )
+                            self._detection_events.emit(vlm_event)
+                            zone_action_ids = zone.get("action_ids") or []
+                            dispatch_event(vlm_event, zone_action_ids)
 
                 if yolo_detection.yolo_result is not None:
                     depth_on = self.get_depth_show() or self._any_zone_wants_depth(red_zones)
@@ -461,6 +515,7 @@ class DetectionPipeline:
                                             detected_class=detected_class,
                                             timestamp=datetime.now(),
                                             zone=zone,
+                                            scene_id=cfg.scene.get("scene_id"),
                                         )
                                         self._detection_events.emit(zone_event)
                                         zone_action_ids = zone.get("action_ids") or []
@@ -491,6 +546,23 @@ class DetectionPipeline:
                                     self._last_vlm_frame = frame.copy()
                                     self._vlm_fired_for_zone.add(zi)
                                     self._pending_vlm_is_global = False
+
+                    global_class = self._check_global_detection(yolo_detection.yolo_result, cfg, now_vlm)
+                    if global_class is not None:
+                        logger.info(f"DetectionEvent trigger — global detection, class={global_class}")
+                        global_event = DetectionEvent(
+                            annotated_image=annotated.copy(),
+                            trigger="global_detection",
+                            raw_frame=frame.copy(),
+                            detected_class=global_class,
+                            timestamp=datetime.now(),
+                            zone=None,
+                            scene_id=cfg.scene.get("scene_id"),
+                        )
+                        self._detection_events.emit(global_event)
+                        global_action_ids = cfg.global_detection_action_ids or []
+                        dispatch_event(global_event, global_action_ids)
+                        self._last_global_detection_time = now_vlm
 
                     depth_map = yolo_detection.depth_map
                     if depth_map is not None:

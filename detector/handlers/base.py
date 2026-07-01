@@ -35,6 +35,7 @@ def _build_metadata(event: DetectionEvent) -> dict:
     return {
         "trigger": event.trigger,
         "timestamp": event.timestamp.isoformat(),
+        "scene_id": event.scene_id,
         "detected_class": event.detected_class,
         "vlm_prompt": event.vlm_prompt,
         "vlm_answer": event.vlm_answer,

@@ -20,8 +20,6 @@ logger = logging.getLogger(__name__)
 
 
 def _snapshot_hash(actions: list[dict]) -> str:
-    """Stable hash of the action list. Used to suppress no-op set_actions
-    calls when the backend returned the same data we already have."""
     norm = sorted(
         (
             a.get("action_id"),
@@ -35,9 +33,10 @@ def _snapshot_hash(actions: list[dict]) -> str:
 
 
 class ActionsWatcher:
-    """Background thread that polls `GET {api_base}/action/` and calls
+    """Background thread that polls `GET {api_base}/action/internal/` and calls
     `on_change(actions)` whenever the snapshot changes.
 
+    Uses the internal endpoint to receive full action credentials.
     First tick after `start()` always fires (same pattern as ConfigWatcher).
     """
 
@@ -46,6 +45,7 @@ class ActionsWatcher:
         api_base: str,
         on_change: Callable[[list[dict]], None],
         poll_interval: Optional[float] = None,
+        api_key: Optional[str] = None,
     ):
         self._api_base = api_base.rstrip("/")
         self._on_change = on_change
@@ -59,6 +59,8 @@ class ActionsWatcher:
         self._last_hash: Optional[str] = None
         self._force_emit = True
         self._session = requests.Session()
+        if api_key:
+            self._session.headers["X-API-Key"] = api_key
 
     def start(self) -> None:
         if self._thread is not None:
@@ -81,7 +83,7 @@ class ActionsWatcher:
 
     def _run(self) -> None:
         logger.info(
-            "ActionsWatcher started — polling %s/action/ every %.1fs",
+            "ActionsWatcher started — polling %s/action/internal/ every %.1fs",
             self._api_base, self._poll_interval,
         )
         while not self._stop_event.is_set():
@@ -112,13 +114,13 @@ class ActionsWatcher:
 
     def _fetch_actions(self) -> Optional[list[dict]]:
         try:
-            r = self._session.get(f"{self._api_base}/action/", timeout=5.0)
+            r = self._session.get(f"{self._api_base}/action/internal/", timeout=5.0)
             r.raise_for_status()
             data = r.json()
             if not isinstance(data, list):
-                logger.warning("Unexpected /action/ payload (not a list): %r", type(data))
+                logger.warning("Unexpected /action/internal/ payload (not a list): %r", type(data))
                 return None
             return data
         except Exception as e:
-            logger.debug("Failed to fetch /action/: %s", e)
+            logger.debug("Failed to fetch /action/internal/: %s", e)
             return None

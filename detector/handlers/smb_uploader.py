@@ -63,7 +63,8 @@ class SmbUploaderHandler(BaseActionHandler):
 
     def _deliver(self, event: DetectionEvent, payload: dict) -> None:
         ts = event.timestamp.strftime("%Y%m%d_%H%M%S_%f")
-        subfolder = f"{ts}_{event.trigger}"
+        scene_id = event.scene_id or "unknown_scene"
+        subfolder = f"{scene_id}/{ts}_{event.trigger}"
         try:
             self._ensure_session()
             self._upload_files(subfolder, payload)

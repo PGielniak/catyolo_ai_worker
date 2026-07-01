@@ -5,7 +5,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import cv2
 import numpy as np
@@ -45,6 +45,7 @@ class Hailo8Backend(InferenceBackend):
         hef_config: dict,
         reference_image: Optional[np.ndarray] = None,
         red_zones: Optional[list] = None,
+        shared_device: Any = None,
     ):
         self._capture = capture
         self.yolo_classes = yolo_classes
@@ -62,7 +63,12 @@ class Hailo8Backend(InferenceBackend):
         self._latest: Optional[HailoResult] = None
         self._setup_complete = threading.Event()
 
+        # Device ownership: shared (multi-camera, owned by main()) vs owned
+        # (legacy/test path). See hailo10_backend.py for the full rationale.
         self._device = None
+        self._shared_device = shared_device
+        self._owns_device = shared_device is None
+
         self._yolo_infer_model = None
         self._yolo_configured_infer_model = None
         self._desired_h: Optional[int] = None
@@ -81,7 +87,11 @@ class Hailo8Backend(InferenceBackend):
         self._reference_depths_ready = threading.Event()
 
         has_depth = self._depth_path is not None
-        self._capabilities = BackendCapabilities(supports_vlm=False, supports_depth=has_depth)
+        self._capabilities = BackendCapabilities(
+            supports_vlm=False,
+            supports_depth=has_depth,
+            max_concurrent_streams=3,
+        )
 
     @property
     def capabilities(self) -> BackendCapabilities:
@@ -121,18 +131,24 @@ class Hailo8Backend(InferenceBackend):
     # ------------------------------------------------------------------ #
 
     def _setup(self) -> None:
-        from hailo_platform import Device, HailoSchedulingAlgorithm, VDevice
+        if self._shared_device is not None:
+            # Multi-camera path: attach to the VDevice owned by main().
+            self._device = self._shared_device
+            logger.info("Attaching to shared VDevice (owned by main)")
+        else:
+            # Legacy/test path: own the VDevice lifecycle.
+            from hailo_platform import Device, HailoSchedulingAlgorithm, VDevice
 
-        with Device() as dev:
-            ids = dev.scan()
-            logger.info("Available Hailo devices: %s", ids)
-        if not ids:
-            raise RuntimeError("No Hailo devices found")
+            with Device() as dev:
+                ids = dev.scan()
+                logger.info("Available Hailo devices: %s", ids)
+            if not ids:
+                raise RuntimeError("No Hailo devices found")
 
-        params = VDevice.create_params()
-        params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
-        params.group_id = "SHARED"
-        self._device = VDevice(params)
+            params = VDevice.create_params()
+            params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
+            params.group_id = "SHARED"
+            self._device = VDevice(params)
 
         self._setup_yolo()
         if self._depth_path is not None:
@@ -179,11 +195,14 @@ class Hailo8Backend(InferenceBackend):
                 logger.exception("Error releasing %s", attr)
 
         try:
-            if self._device is not None:
+            if self._device is not None and self._owns_device:
                 self._device.release()
-                self._device = None
         except Exception:
             logger.exception("Error releasing VDevice")
+        finally:
+            # Always drop our reference. For shared devices this does NOT
+            # release the underlying VDevice — main() owns and releases it.
+            self._device = None
 
     # ------------------------------------------------------------------ #
     # Background thread

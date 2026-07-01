@@ -23,6 +23,11 @@ class DetectionEvent:
     # trigger="global_description"). Action handlers use this to look up the
     # scene-level scene_prompt_action_ids instead of the per-zone action_ids.
     is_global_prompt: bool = False
+    # The scene this event originated from (multi-camera). Set by the
+    # pipeline from its SceneConfig so every downstream consumer (sample
+    # folders, telegram caption, webhook metadata, SMB folder, logs) can
+    # disambiguate events across scenes.
+    scene_id: Optional[str] = None
 
 
 # Kept for backward compatibility with any external subscribers.
@@ -42,7 +47,8 @@ class DetectionEventEmitter:
         with self._lock:
             handlers = list(self._handlers)
         logger.info(
-            "DetectionEvent emitted — trigger=%s class=%s zone=%s handlers=%d prompt=%s answer=%s",
+            "DetectionEvent emitted — scene=%s trigger=%s class=%s zone=%s handlers=%d prompt=%s answer=%s",
+            event.scene_id or "-",
             event.trigger,
             event.detected_class or "-",
             "global" if event.zone is None else event.zone.get("id", "?"),
