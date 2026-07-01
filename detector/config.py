@@ -54,6 +54,48 @@ def _union_classes(red_zones: list[dict]) -> list[str]:
     return list(classes) if classes else ["cat"]
 
 
+def _normalize_zone(zone: dict) -> dict:
+    """Ensure every red zone has both a `points` polygon and x/y/width/height.
+
+    New zones ship `points`; legacy zones only have x/y/width/height.
+    Back-fill whichever is missing so polygon-aware code and rectangle-only
+    code (e.g. the occlusion detector's bounding-box approximation) both work.
+    """
+    zone = dict(zone)
+    raw_points = zone.get("points")
+    has_points = raw_points and len(raw_points) >= 3
+    x = zone.get("x")
+    y = zone.get("y")
+    w = zone.get("width")
+    h = zone.get("height")
+    has_rect = x is not None and y is not None and w is not None and h is not None
+
+    if has_points and has_rect:
+        return zone
+
+    if has_points:
+        poly = [(float(p[0]), float(p[1])) for p in raw_points]
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        x1 = int(min(xs))
+        y1 = int(min(ys))
+        x2 = int(max(xs))
+        y2 = int(max(ys))
+        zone["x"] = x1
+        zone["y"] = y1
+        zone["width"] = x2 - x1
+        zone["height"] = y2 - y1
+        return zone
+
+    # Legacy rectangle -> points
+    x = int(zone.get("x") or 0)
+    y = int(zone.get("y") or 0)
+    w = int(zone.get("width") or 0)
+    h = int(zone.get("height") or 0)
+    zone["points"] = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+    return zone
+
+
 @dataclass(frozen=True)
 class SceneConfig:
     """Immutable snapshot of the scene config the pipeline is currently running
@@ -88,7 +130,7 @@ class SceneConfig:
         on GET /scene/internal/). Deep-copies the red zone dicts so downstream
         mutators (occlusion tracking) can't trample later payloads."""
         raw_zones = scene.get("red_zones") or []
-        red_zones = [dict(rz) for rz in raw_zones]
+        red_zones = [_normalize_zone(dict(rz)) for rz in raw_zones]
         ref_img = _decode_reference_image((scene.get("image") or {}).get("image"))
         return cls(
             scene=dict(scene),

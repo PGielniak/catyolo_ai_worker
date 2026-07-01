@@ -12,6 +12,12 @@ from detector.inference.factory import create_backend
 from detector.inference.protocols import InferenceBackend
 from detector.events import DetectionEventEmitter, DetectionEvent, dispatch_event
 from detector.config import SceneConfig
+from detector.geometry import (
+    box_polygon_intersection_area,
+    point_in_polygon,
+    polygon_bounding_box,
+    zone_to_polygon,
+)
 
 import ctypes
 
@@ -51,6 +57,9 @@ class DetectionPipeline:
         # rest of the iteration. reload_config() swaps it atomically.
         self._config_lock = threading.Lock()
         self._current_config: SceneConfig = initial_config
+        # Pre-computed OpenCV polygon arrays so _draw_zones doesn't rebuild them
+        # every frame. Recomputed whenever the config reloads.
+        self._red_zone_polygons = self._compute_zone_polygons(initial_config.red_zones)
         # Serializes reload_config() calls so two reloads can't race.
         self._reload_lock = threading.Lock()
 
@@ -224,6 +233,7 @@ class DetectionPipeline:
                 self._current_config = new_config
                 self._occlusion_detector = new_occlusion
                 self._hailo_runner = new_hailo
+                self._red_zone_polygons = self._compute_zone_polygons(new_config.red_zones)
 
             # ---- Start new threads (no-op if start() was never called) ----
             try:
@@ -274,17 +284,8 @@ class DetectionPipeline:
             return self._last_vlm_answer
 
     @staticmethod
-    def _iou(box1, box2):
-        x1 = max(box1[0], box2[0])
-        y1 = max(box1[1], box2[1])
-        x2 = min(box1[2], box2[2])
-        y2 = min(box1[3], box2[3])
-        if x2 <= x1 or y2 <= y1:
-            return 0.0
-        inter = (x2 - x1) * (y2 - y1)
-        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-        return inter / (area1 + area2 - inter)
+    def _box_polygon_overlap(box, polygon):
+        return box_polygon_intersection_area(box, polygon) > 0
 
     def _overlapping_zone_indices(self, yolo_result, red_zones):
         """Returns {zone_index: first_matching_class} for zones with a forbidden-class bbox overlap."""
@@ -296,8 +297,8 @@ class DetectionPipeline:
             for idx, rz in enumerate(red_zones):
                 if idx in hits:
                     continue
-                rz_box = (rz["x"], rz["y"], rz["x"] + rz["width"], rz["y"] + rz["height"])
-                if self._iou(det_box, rz_box) > 0:
+                poly = zone_to_polygon(rz)
+                if self._box_polygon_overlap(det_box, poly):
                     forbidden = rz.get("forbidden_classes", [])
                     if det.label in forbidden:
                         hits[idx] = det.label
@@ -389,10 +390,13 @@ class DetectionPipeline:
                 cfg = self._current_config
                 occlusion = self._occlusion_detector
                 hailo = self._hailo_runner
+                zone_polys = self._red_zone_polygons
 
             red_zones = cfg.red_zones
             scene_prompt = cfg.scene_prompt
             scene_prompt_interval = cfg.scene_prompt_interval
+
+            self._draw_zones(annotated, zone_polys)
 
             result = occlusion.process(frame)
 
@@ -622,8 +626,14 @@ class DetectionPipeline:
 
 
     def _draw_vlm_answer(self, annotated, answer, zone, question=None, color=(255, 255, 255)):
-        x = zone.get("x", 10) if zone else 10
-        y = zone.get("y", 30) if zone else 30
+        if zone:
+            poly = zone_to_polygon(zone)
+            x1, y1, _, _ = polygon_bounding_box(poly)
+            x = int(x1)
+            y = int(y1)
+        else:
+            x = 10
+            y = 30
         font = cv2.FONT_HERSHEY_SIMPLEX
         scale = 0.5
         thickness = 1
@@ -643,12 +653,36 @@ class DetectionPipeline:
             cv2.putText(annotated, text, (text_x, text_y + th),
                         font, scale, clr, thickness)
 
+    @staticmethod
+    def _compute_zone_polygons(red_zones):
+        polys = []
+        for rz in red_zones:
+            poly = zone_to_polygon(rz)
+            if len(poly) >= 3:
+                polys.append(np.array(poly, dtype=np.int32).reshape((-1, 1, 2)))
+        return polys
+
+    def _draw_zones(self, annotated, zone_polys):
+        if not zone_polys:
+            return
+        # One overlay, one blend, one outline pass — much cheaper than a
+        # per-zone copy/blend when there are several zones.
+        overlay = annotated.copy()
+        for pts in zone_polys:
+            cv2.fillPoly(overlay, [pts], (255, 0, 0))
+        cv2.addWeighted(overlay, 0.15, annotated, 0.85, 0, annotated)
+        for pts in zone_polys:
+            cv2.polylines(annotated, [pts], True, (255, 0, 0), 2)
+
     def _draw_occlusion(self, annotated, result):
         for rz in result.zones:
-            x_start = rz['x']
-            y_start = rz['y']
-            x_end = x_start + rz['width']
-            y_end = y_start + rz['height']
+            # Draw the configured polygon, not the tracked bounding box.
+            # The occlusion math still uses the simple bbox approximation internally.
+            poly = zone_to_polygon(rz)
+            if len(poly) < 3:
+                continue
+            pts = np.array(poly, dtype=np.int32).reshape((-1, 1, 2))
+            x1, y1, _, _ = polygon_bounding_box(poly)
 
             if rz['occluded']:
                 colour = (0, 0, 255)
@@ -658,8 +692,8 @@ class DetectionPipeline:
                 status = 'free'
 
             cv2.putText(annotated, f"{status} - {rz['occlusion_score']:.2f}",
-                        (x_start, y_start - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 2)
-            cv2.rectangle(annotated, (x_start, y_start), (x_end, y_end), colour, 2)
+                        (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 2)
+            cv2.polylines(annotated, [pts], True, colour, 2, lineType=cv2.LINE_AA)
 
     def _draw_yolo_detection(self, annotated, detection):
         for det in detection.yolo_result.detections:

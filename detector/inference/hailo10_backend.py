@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 
 from detector.capture import FrameCapture
+from detector.geometry import polygon_bounding_box, zone_to_polygon
 from detector.inference.preprocessing import COCO_CLASSES, bbox_unmap, letterbox
 from detector.inference.protocols import (
     BackendCapabilities,
@@ -606,18 +607,28 @@ class Hailo10Backend(InferenceBackend):
                 self._reference_depths_ready.set()
                 return
             for idx, rz in enumerate(self._red_zones):
-                x = max(0, int(rz["x"]))
-                y = max(0, int(rz["y"]))
-                w = int(rz["width"])
-                h = int(rz["height"])
-                x2 = min(depth_map.shape[1], x + w)
-                y2 = min(depth_map.shape[0], y + h)
-                if x2 <= x or y2 <= y:
+                poly = zone_to_polygon(rz)
+                x1, y1, x2, y2 = polygon_bounding_box(poly)
+                x1 = max(0, int(x1))
+                y1 = max(0, int(y1))
+                x2 = min(depth_map.shape[1], int(x2))
+                y2 = min(depth_map.shape[0], int(y2))
+                if x2 <= x1 or y2 <= y1:
                     logger.warning("Zone %d has zero-area crop; skipping reference depth", idx)
                     continue
-                crop = depth_map[y:y2, x:x2]
-                if crop.size > 0:
-                    self._reference_depths[idx] = float(np.median(crop))
+
+                crop = depth_map[y1:y2, x1:x2]
+                if crop.size == 0:
+                    continue
+
+                pts = np.array(poly, dtype=np.int32).reshape((-1, 1, 2))
+                shifted = pts - np.array([[x1, y1]], dtype=np.int32)
+                mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
+                cv2.fillPoly(mask, [shifted], 1)
+                if mask.sum() == 0:
+                    logger.warning("Zone %d produced empty polygon mask; skipping reference depth", idx)
+                    continue
+                self._reference_depths[idx] = float(np.median(crop[mask.astype(bool)]))
             logger.info("Reference depths: %s", self._reference_depths)
         except Exception:
             logger.exception("Failed to compute reference depth map")
